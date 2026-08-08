@@ -41,6 +41,7 @@ class OperationStatus(str, Enum):
     CONFIRMED = "confirmed"
     FAILED = "failed"
     UNKNOWN = "unknown"
+    OBSERVED_NO_EFFECT = "observed_no_effect"
 
 
 class SequenceStatus(str, Enum):
@@ -69,9 +70,11 @@ class TargetLegState(str, Enum):
     DESIRED = "desired"
     CREATE_PENDING = "create_pending"
     ACTIVE = "active"
+    PARTIAL_FILL = "partial_fill"
     CANCEL_PENDING = "cancel_pending"
     CANCELLED = "cancelled"
     FILLED = "filled"
+    MISSING_ON_TARGET = "missing_on_target"
     FAILED = "failed"
     UNKNOWN = "unknown"
 
@@ -113,6 +116,18 @@ class SourcePosition:
 
 
 @dataclass(frozen=True)
+class SourceQuote:
+    source_symbol: str
+    bid: Decimal | None
+    ask: Decimal | None
+    occurred_at_utc: str
+
+    @property
+    def is_complete(self) -> bool:
+        return self.bid is not None and self.ask is not None
+
+
+@dataclass(frozen=True)
 class SourceEvent:
     session_id: str
     event_id: int
@@ -121,7 +136,9 @@ class SourceEvent:
     occurred_at_utc: str
     order: SourceOrder | None = None
     position: SourcePosition | None = None
+    quote: SourceQuote | None = None
     snapshot_orders: tuple[SourceOrder, ...] = ()
+    position_complete: bool | None = None
 
     def __post_init__(self) -> None:
         if not self.session_id:
@@ -144,6 +161,8 @@ class SourceSymbolState:
     position: SourcePosition | None
     active_orders: Mapping[str, SourceOrder]
     synchronized: bool
+    quote: SourceQuote | None = None
+    position_complete: bool = False
 
 
 @dataclass(frozen=True)
@@ -185,6 +204,7 @@ class TargetLeg:
     state: TargetLegState = TargetLegState.DESIRED
     target_order_ticket: str | None = None
     target_position_ticket: str | None = None
+    bridge_tag: str = ""
 
     @property
     def requires_target_order(self) -> bool:
@@ -206,6 +226,7 @@ class TargetOrderState:
     trigger_price: Decimal | None
     source_order_id: str | None = None
     leg_id: str | None = None
+    bridge_tag: str | None = None
 
 
 @dataclass(frozen=True)
@@ -215,6 +236,30 @@ class TargetPositionState:
     ticket: str
     side: str
     quantity: Decimal
+    stop_loss: Decimal | None = None
+    take_profit: Decimal | None = None
+
+
+@dataclass(frozen=True)
+class TargetQuote:
+    target_symbol: str
+    bid: Decimal | None
+    ask: Decimal | None
+    occurred_at_utc: str
+
+    @property
+    def is_complete(self) -> bool:
+        return self.bid is not None and self.ask is not None
+
+
+@dataclass(frozen=True)
+class TargetSymbolSpec:
+    tick_size: Decimal
+    volume_min: Decimal
+    volume_max: Decimal
+    volume_step: Decimal
+    stops_level: Decimal
+    freeze_level: Decimal
 
 
 @dataclass(frozen=True)
@@ -228,6 +273,9 @@ class TargetAccountState:
     pending_orders: tuple[TargetOrderState, ...] = ()
     positions: tuple[TargetPositionState, ...] = ()
     snapshot_complete: bool = True
+    quote: TargetQuote | None = None
+    symbol_spec: TargetSymbolSpec | None = None
+    foreign_symbol_objects_present: bool = False
 
     @property
     def net_quantity(self) -> Decimal:
@@ -268,6 +316,8 @@ class OperationRecord:
     status: OperationStatus
     target_reference: str | None = None
     message: str = ""
+    dispatched_at_utc: str | None = None
+    resolved_at_utc: str | None = None
 
 
 @dataclass(frozen=True)

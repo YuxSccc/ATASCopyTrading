@@ -1,8 +1,9 @@
 # Bridge V2: Integration Boundaries
 
-This design defines the integration boundaries for the implemented safe bridge
-core. Live MT5 execution, price conversion, and broker-specific validation are
-deliberately still outside the executable runtime.
+This design defines the integration boundaries for the implemented bridge core.
+The live boundary is local and deliberately gated: a Python service maintains
+durable state, while a small MQL5 EA is the only component that can submit a
+request to the MT5 terminal.
 
 ## Boundaries
 
@@ -46,31 +47,35 @@ concurrent stale actions for the same instrument.
 
 ### 5. MT5 execution adapter
 
-Initial implementation may use Python `MetaTrader5` for validation. Its public
-contract must support market execution, pending create/modify/remove, and
-position SL/TP modification. A later MQL5 EA adapter can use `OrderSendAsync`
-when measurements show Python's synchronous request is the relevant bottleneck.
-The execution adapter reports request acceptance separately from confirmed
-account state.
+`mt5_ea/AtasMt5BridgeEA.mq5` uses a loopback HTTP protocol and
+`OrderSendAsync`. It polls at a configurable interval (100 ms by default),
+but execution is disabled by default in both the EA and Python service. The
+execution adapter reports queue delivery and request acceptance separately
+from confirmed account state.
 
 ### 6. MT5 transaction observer
 
-For production, a minimal MQL5 EA should forward `OnTradeTransaction` events
-to the local bridge. It confirms order/position state after manual actions,
-pending activation, partial fills, and broker changes. Python's `positions_get`
-and `orders_get` remain useful periodic snapshots, but are not a push feed.
+The EA schedules an immediate full, bridge-filtered snapshot after
+`OnTradeTransaction`, and also publishes a periodic snapshot. That snapshot
+confirms order/position state after manual actions, pending activation, partial
+fills, and broker changes. A command is never considered complete solely
+because `OrderSendAsync` accepted its local request.
 
 ### 7. Quote adapters
 
 ATAS and MT5 quotes are collected independently with their source timestamps,
 bid/ask values, and freshness. No price mapping is performed at this boundary.
 That preserves the option to use raw-price, offset, or relative-distance mapping
-only after the observed data supports it.
+only after the observed data supports it. The initial live policy stores a
+four-hour side-aware GC/XAUUSD basis history in SQLite, uses a recent-weighted
+median, and blocks new pending orders when quotes are stale, the basis shocks,
+the dispersion is high, the resulting volume is invalid, or an MT5 stops/freeze
+rule would be violated.
 
 ## Implemented safe framework
 
 The framework is in `src/atas_mt5_bridge/v2/`. It is deliberately separate
-from the legacy target-net bridge and is not connected to a live MT5 adapter.
+from the deleted legacy target-net bridge.
 
 - `atas_adapter.py` converts probe messages to a canonical source event.
 - `source_state.py` maintains the current ATAS position and active order
@@ -80,8 +85,15 @@ from the legacy target-net bridge and is not connected to a live MT5 adapter.
 - `policy.py` contains the ATAS-authoritative net-equivalent policy. It is
   disabled by default and does not send commands unless explicitly enabled by
   a non-live simulator.
-- `coordinator.py` defines the one-worker execution boundary, in-flight risk
-  limit, unknown-outcome block, and MT5-observer reconciliation entry point.
+- `coordinator.py` defines the one-worker execution boundary, persisted
+  write-ahead operation state, in-flight risk limit, unknown-outcome block,
+  and MT5-observer reconciliation entry point.
+- `persistence.py`, `state_codec.py`, and `operation_book.py` persist source
+  checkpoints, ledger legs, operation outcomes, and price history to SQLite.
+- `pricing.py` applies the side-aware basis and market-validity guard before a
+  risk-increasing pending order can be created.
+- `mt5_gateway.py` and `live_service.py` implement the local authenticated
+  MT5 EA protocol. The gateway never connects to a broker directly.
 - `simulation.py` and `runtime.py` run deterministic local tests through the
   existing probe protocol; neither module can connect to MT5.
 
@@ -95,11 +107,16 @@ The framework records those as auxiliary events to validate continuity, but
 does not call a copy policy for them. A gap blocks planning until a fresh
 source snapshot is received.
 
-The execution port records `accepted`, `confirmed`, `failed`, and `unknown`
-separately. A failed or unknown target result blocks further automatic plans
-for that symbol and marks it as requiring reconciliation. A target observer
-can call `handle_target_observation()` after an MT5 transaction to finish a
-pending cancellation or repair without waiting for another ATAS event.
+The execution port records `pending`, `accepted`, `confirmed`, `failed`, and
+`unknown` separately. Every command is persisted before it is offered to the
+EA. A failed or unknown target result blocks further automatic plans for that
+symbol and marks it as requiring reconciliation. On process restart unresolved
+commands may be offered again only through the EA's durable command-ID
+deduplication protocol; an EA that restarted after persisting intent but before
+recording the request outcome reports `unknown` instead of submitting a second
+request. A target observer can call `handle_target_observation()` after an MT5
+transaction to finish a pending cancellation or repair without waiting for
+another ATAS event.
 
 `TargetAccountState` explicitly retains long and short quantities and the
 target account model (`netting` or `hedging`). Consequently, a later position

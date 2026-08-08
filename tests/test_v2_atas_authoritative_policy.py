@@ -19,6 +19,8 @@ from atas_mt5_bridge.v2.models import (
     TargetLegState,
     TargetOrderState,
     TargetPositionState,
+    TargetQuote,
+    TargetSymbolSpec,
 )
 from atas_mt5_bridge.v2.policy import AtasAuthoritativePolicy
 
@@ -50,6 +52,8 @@ def target_state(
     pending_orders=(),
     positions=(),
     complete: bool = True,
+    quote: TargetQuote | None = None,
+    symbol_spec: TargetSymbolSpec | None = None,
 ) -> TargetAccountState:
     return TargetAccountState(
         target_symbol="XAUUSD",
@@ -59,6 +63,8 @@ def target_state(
         pending_orders=tuple(pending_orders),
         positions=tuple(positions),
         snapshot_complete=complete,
+        quote=quote,
+        symbol_spec=symbol_spec,
     )
 
 
@@ -295,3 +301,162 @@ def test_target_observation_finishes_a_cancel_that_arrived_before_create_confirm
     observed = coordinator.handle_target_observation()
 
     assert [command.command_type for command in observed.commands] == [CommandType.CANCEL_PENDING]
+
+
+def test_target_partial_pending_fill_is_aggressively_cancelled_before_net_repair():
+    port = MutableExecutionPort(target_state())
+    coordinator = SymbolCoordinator("GC", "XAUUSD", port, policy=AtasAuthoritativePolicy(execution_enabled=True))
+    coordinator.handle(snapshot())
+    coordinator.handle(event(2, SourceEventType.ORDER, order=source_order()))
+    leg = next(iter(coordinator.ledger.legs.values()))
+    port.state = target_state(
+        pending_orders=(
+            TargetOrderState(
+                ticket="partial-order",
+                side="sell",
+                order_type="stop",
+                quantity=Decimal("1"),
+                price=Decimal("4000"),
+                trigger_price=Decimal("4000"),
+                leg_id=leg.leg_id,
+            ),
+        )
+    )
+
+    result = coordinator.handle_target_observation()
+
+    assert coordinator.ledger.get_leg(leg.leg_id).state == TargetLegState.CANCEL_PENDING
+    assert [command.command_type for command in result.commands] == [CommandType.CANCEL_PENDING]
+
+
+def test_unknown_cancel_is_confirmed_when_a_complete_snapshot_has_no_matching_order():
+    port = MutableExecutionPort(target_state())
+    coordinator = SymbolCoordinator("GC", "XAUUSD", port, policy=AtasAuthoritativePolicy(execution_enabled=True))
+    coordinator.handle(snapshot())
+    coordinator.handle(event(2, SourceEventType.ORDER, order=source_order()))
+    leg = next(iter(coordinator.ledger.legs.values()))
+    port.state = target_state(
+        pending_orders=(
+            TargetOrderState(
+                ticket="existing-order",
+                side="sell",
+                order_type="stop",
+                quantity=Decimal("2"),
+                price=Decimal("4000"),
+                trigger_price=Decimal("4000"),
+                leg_id=leg.leg_id,
+            ),
+        )
+    )
+    coordinator.handle_target_observation()
+    port.raise_on_execute = True
+    cancelled_source_order = SourceOrder(**{**source_order().__dict__, "state": SourceOrderState.DONE, "cancelled": True})
+    cancelled = coordinator.handle(event(3, SourceEventType.ORDER, order=cancelled_source_order))
+    assert cancelled.receipts[0].status == OperationStatus.UNKNOWN
+    assert coordinator.ledger.get_leg(leg.leg_id).state == TargetLegState.UNKNOWN
+
+    port.raise_on_execute = False
+    port.state = target_state()
+    observed = coordinator.handle_target_observation()
+
+    assert observed.reconciliation_required is False
+    assert coordinator.ledger.get_leg(leg.leg_id).state == TargetLegState.CANCELLED
+
+
+def test_active_target_pending_order_missing_from_complete_snapshot_quarantines_the_symbol():
+    port = MutableExecutionPort(target_state())
+    coordinator = SymbolCoordinator("GC", "XAUUSD", port, policy=AtasAuthoritativePolicy(execution_enabled=True))
+    coordinator.handle(snapshot())
+    coordinator.handle(event(2, SourceEventType.ORDER, order=source_order()))
+    leg = next(iter(coordinator.ledger.legs.values()))
+    port.state = target_state(
+        pending_orders=(
+            TargetOrderState(
+                ticket="existing-order",
+                side="sell",
+                order_type="stop",
+                quantity=Decimal("2"),
+                price=Decimal("4000"),
+                trigger_price=None,
+                leg_id=leg.leg_id,
+            ),
+        )
+    )
+    coordinator.handle_target_observation()
+    port.state = target_state()
+
+    observed = coordinator.handle_target_observation()
+
+    assert observed.reconciliation_required is True
+    assert coordinator.ledger.get_leg(leg.leg_id).state == TargetLegState.MISSING_ON_TARGET
+
+
+def test_atas_tp_sl_comments_map_to_native_mt5_position_protection_not_opposite_pending_orders():
+    quote = TargetQuote("XAUUSD", Decimal("4000"), Decimal("4000.2"), "2026-08-08T00:00:00Z")
+    symbol_spec = TargetSymbolSpec(
+        tick_size=Decimal("0.1"),
+        volume_min=Decimal("1"),
+        volume_max=Decimal("100"),
+        volume_step=Decimal("1"),
+        stops_level=Decimal("0.1"),
+        freeze_level=Decimal("0.1"),
+    )
+    protection_target = target_state(
+        long="2",
+        positions=(TargetPositionState("long-ticket", "long", Decimal("2")),),
+        quote=quote,
+        symbol_spec=symbol_spec,
+    )
+    port = MutableExecutionPort(protection_target)
+    coordinator = SymbolCoordinator("GC", "XAUUSD", port, policy=AtasAuthoritativePolicy(execution_enabled=True))
+    stop_loss = SourceOrder(**{**source_order("sl").__dict__, "comment": "SL", "trigger_price": Decimal("3991"), "price": Decimal("0")})
+    take_profit = SourceOrder(
+        **{
+            **source_order("tp").__dict__,
+            "comment": "TP",
+            "order_type": "limit",
+            "price": Decimal("4007"),
+            "trigger_price": None,
+        }
+    )
+
+    result = coordinator.handle(snapshot(position="2", orders=(stop_loss, take_profit)))
+
+    assert [command.command_type for command in result.commands] == [CommandType.MODIFY_POSITION_PROTECTION]
+    assert result.commands[0].payload == {
+        "position_ticket": "long-ticket",
+        "stop_loss": Decimal("3991"),
+        "take_profit": Decimal("4007"),
+    }
+
+
+def test_same_atas_order_id_price_change_cancels_confirmed_target_leg_then_versions_replacement():
+    port = MutableExecutionPort(target_state())
+    coordinator = SymbolCoordinator("GC", "XAUUSD", port, policy=AtasAuthoritativePolicy(execution_enabled=True))
+    coordinator.handle(snapshot())
+    coordinator.handle(event(2, SourceEventType.ORDER, order=source_order("same-id")))
+    original_leg = next(iter(coordinator.ledger.legs.values()))
+    port.state = target_state(
+        pending_orders=(
+            TargetOrderState(
+                ticket="old-ticket",
+                side="sell",
+                order_type="stop",
+                quantity=Decimal("2"),
+                price=Decimal("4000"),
+                trigger_price=None,
+                leg_id=original_leg.leg_id,
+            ),
+        )
+    )
+    coordinator.handle_target_observation()
+    moved = SourceOrder(**{**source_order("same-id").__dict__, "trigger_price": Decimal("3999")})
+
+    cancel = coordinator.handle(event(3, SourceEventType.ORDER, order=moved))
+
+    assert [command.command_type for command in cancel.commands] == [CommandType.CANCEL_PENDING]
+    port.state = target_state()
+    replacement = coordinator.handle_target_observation()
+    assert [command.command_type for command in replacement.commands] == [CommandType.CREATE_PENDING]
+    assert replacement.commands[0].leg_id != original_leg.leg_id
+    assert replacement.commands[0].payload["price"] == Decimal("3999")

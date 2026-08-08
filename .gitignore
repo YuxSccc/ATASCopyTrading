@@ -7,6 +7,9 @@ probe-data/
 
 # Local runtime configuration
 config.local*.json
+bridge-state/
+*.compile.log
+*.ex5
 
 # ATAS/.NET build artifacts
 **/bin/

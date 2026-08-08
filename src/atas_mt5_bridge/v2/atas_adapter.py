@@ -3,7 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any, Mapping
 
-from .models import SourceEvent, SourceEventType, SourceOrder, SourceOrderState, SourcePosition
+from .models import SourceEvent, SourceEventType, SourceOrder, SourceOrderState, SourcePosition, SourceQuote
 
 
 def parse_probe_message(message: Mapping[str, Any]) -> SourceEvent:
@@ -38,6 +38,18 @@ def parse_probe_message(message: Mapping[str, Any]) -> SourceEvent:
             event_type=SourceEventType.SNAPSHOT,
             position=position,
             snapshot_orders=tuple(_parse_order(order) for order in raw_orders if isinstance(order, Mapping)),
+            position_complete=bool(data.get("position_known", position is not None)),
+            **common,
+        )
+    if event_type == "quote":
+        return SourceEvent(
+            event_type=SourceEventType.AUXILIARY,
+            quote=SourceQuote(
+                source_symbol=common["source_symbol"],
+                bid=_optional_decimal(data.get("best_bid")),
+                ask=_optional_decimal(data.get("best_ask")),
+                occurred_at_utc=common["occurred_at_utc"],
+            ),
             **common,
         )
     return SourceEvent(event_type=SourceEventType.AUXILIARY, **common)

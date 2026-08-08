@@ -8,6 +8,7 @@ from .models import (
     SourceEventType,
     SourceOrder,
     SourcePosition,
+    SourceQuote,
     SourceSymbolState,
 )
 
@@ -27,6 +28,12 @@ class SourceStateBook:
     _position: SourcePosition | None = None
     _active_orders: dict[str, SourceOrder] = field(default_factory=dict)
     _synchronized: bool = False
+    _quote: SourceQuote | None = None
+    _position_complete: bool = False
+
+    @property
+    def has_synchronized_snapshot(self) -> bool:
+        return self._session_id is not None and self._synchronized
 
     def apply(self, event: SourceEvent) -> SequenceStatus:
         if event.source_symbol != self.source_symbol:
@@ -66,7 +73,22 @@ class SourceStateBook:
             position=self._position,
             active_orders=dict(self._active_orders),
             synchronized=self._synchronized,
+            quote=self._quote,
+            position_complete=self._position_complete,
         )
+
+    def restore(self, state: SourceSymbolState) -> None:
+        """Restore only a durable canonical checkpoint for this source symbol."""
+
+        if state.source_symbol != self.source_symbol:
+            raise ValueError(f"checkpoint belongs to {state.source_symbol}, expected {self.source_symbol}")
+        self._session_id = state.session_id
+        self._last_event_id = state.last_event_id
+        self._position = state.position
+        self._active_orders = dict(state.active_orders)
+        self._synchronized = state.synchronized
+        self._quote = state.quote
+        self._position_complete = state.position_complete
 
     def _reset_for_session(self, session_id: str) -> None:
         self._session_id = session_id
@@ -74,10 +96,13 @@ class SourceStateBook:
         self._position = None
         self._active_orders.clear()
         self._synchronized = False
+        self._quote = None
+        self._position_complete = False
 
     def _apply_payload(self, event: SourceEvent) -> None:
         if event.event_type == SourceEventType.SNAPSHOT:
             self._position = event.position
+            self._position_complete = event.position_complete if event.position_complete is not None else event.position is not None
             self._active_orders = {
                 order.source_order_id: order
                 for order in event.snapshot_orders
@@ -85,6 +110,9 @@ class SourceStateBook:
             }
         elif event.event_type == SourceEventType.POSITION:
             self._position = event.position
+            self._position_complete = True
+        elif event.event_type == SourceEventType.AUXILIARY and event.quote is not None:
+            self._quote = event.quote
         elif event.order is not None:
             if event.order.is_active:
                 self._active_orders[event.order.source_order_id] = event.order

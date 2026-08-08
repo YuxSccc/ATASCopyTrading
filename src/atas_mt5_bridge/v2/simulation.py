@@ -77,6 +77,7 @@ class SimulatedTargetExecutionPort(TargetExecutionPort):
             trigger_price=_optional_decimal(command.payload.get("trigger_price")),
             source_order_id=command.source_order_id,
             leg_id=command.leg_id,
+            bridge_tag=str(command.payload.get("bridge_tag", "")) or None,
         )
         return ExecutionReceipt(command.command_id, OperationStatus.CONFIRMED, target_reference=ticket)
 

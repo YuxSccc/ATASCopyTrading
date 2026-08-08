@@ -6,6 +6,7 @@ requires-python = ">=3.10"
 
 [project.scripts]
 atas-mt5-probe-server = "atas_mt5_bridge.probe.server:main"
+atas-mt5-live-service = "atas_mt5_bridge.v2.live_service:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

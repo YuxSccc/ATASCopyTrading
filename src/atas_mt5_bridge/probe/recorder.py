@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -55,10 +55,21 @@ def parse_probe_event(payload: Mapping[str, Any]) -> ProbeEvent:
 @dataclass
 class ProbeRecorder:
     output_directory: Path
+    _recorded_keys: set[tuple[str, int]] = field(default_factory=set, init=False)
 
     def record(self, event: ProbeEvent) -> dict[str, Any]:
         received_utc = datetime.now(timezone.utc).isoformat(timespec="microseconds")
         received_monotonic_ns = time.perf_counter_ns()
+        event_key = (event.session_id, event.event_id)
+        if event_key in self._recorded_keys:
+            return {
+                "type": "probe_ack",
+                "protocol_version": 1,
+                "session_id": event.session_id,
+                "event_id": event.event_id,
+                "server_received_utc": received_utc,
+                "server_received_monotonic_ns": received_monotonic_ns,
+            }
         record = {
             "received_at_utc": received_utc,
             "received_monotonic_ns": received_monotonic_ns,
@@ -70,6 +81,8 @@ class ProbeRecorder:
         with output_path.open("a", encoding="utf-8", newline="\n") as output:
             output.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
             output.write("\n")
+
+        self._recorded_keys.add(event_key)
 
         return {
             "type": "probe_ack",

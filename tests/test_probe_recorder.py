@@ -55,3 +55,15 @@ def test_recorder_writes_jsonl_and_returns_matching_acknowledgement(tmp_path):
     stored = json.loads(output_path.read_text(encoding="utf-8"))
     assert stored["event"]["event_type"] == "order_changed"
     assert stored["event"]["data"]["price"] == 2400.5
+
+
+def test_recorder_acknowledges_outbox_retry_without_duplicate_jsonl_record(tmp_path):
+    event = parse_probe_event(make_payload())
+    recorder = ProbeRecorder(tmp_path)
+
+    first = recorder.record(event)
+    retry = recorder.record(event)
+
+    assert first["event_id"] == retry["event_id"] == 7
+    output_path = tmp_path / "atas_probe_session-123.jsonl"
+    assert len(output_path.read_text(encoding="utf-8").splitlines()) == 1

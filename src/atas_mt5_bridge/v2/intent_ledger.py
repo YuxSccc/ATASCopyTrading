@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
+from hashlib import blake2s
 from typing import Iterable, Mapping
 
 from .models import (
@@ -66,20 +67,39 @@ class IntentLedger:
                 self.intents[intent_id] = replace(intent, state=IntentState.RETIRED)
 
     def ensure_legs(self, intent_id: str, specs: Iterable[TargetLegSpec]) -> tuple[TargetLeg, ...]:
-        """Create legs only once for an intent and return their current state.
+        """Return the live layout, preserving cancelled legs as audit history.
 
-        Replacing a desired layout is intentionally a separate policy action;
-        silent replacement would lose the audit trail for an already submitted
-        target order.
+        An unchanged source order keeps its original leg. A changed order
+        first retires the active target leg; only after cancellation is
+        observed is a new versioned leg created. Desired-but-not-dispatched
+        legs can be updated in place because no MT5 request exists yet.
         """
 
         intent = self.intents[intent_id]
+        requested = tuple(specs)
         existing = self.legs_for_intent(intent_id)
-        if existing:
-            return existing
+        live = tuple(
+            leg
+            for leg in existing
+            if leg.state
+            not in {
+                TargetLegState.CANCELLED,
+                TargetLegState.FILLED,
+            }
+        )
+        if live and _layout_matches(live, requested):
+            return live
+        if live:
+            if all(leg.state == TargetLegState.DESIRED for leg in live) and len(live) == len(requested):
+                updated = tuple(_replace_spec(leg, spec) for leg, spec in zip(live, requested, strict=True))
+                for leg in updated:
+                    self.legs[leg.leg_id] = leg
+                return updated
+            return live
 
         created: list[TargetLeg] = []
-        for index, spec in enumerate(specs, start=1):
+        starting_index = len(existing) + 1
+        for index, spec in enumerate(requested, start=starting_index):
             if spec.quantity <= 0:
                 raise ValueError("target leg quantity must be positive")
             leg = TargetLeg(
@@ -92,6 +112,7 @@ class IntentLedger:
                 quantity=spec.quantity,
                 price=spec.price,
                 trigger_price=spec.trigger_price,
+                bridge_tag=_bridge_tag(f"{intent_id}:leg:{index}"),
             )
             self.legs[leg.leg_id] = leg
             created.append(leg)
@@ -142,6 +163,13 @@ class IntentLedger:
             return
 
         orders_by_leg_id = {order.leg_id: order for order in target.pending_orders if order.leg_id}
+        leg_id_by_tag = {leg.bridge_tag: leg.leg_id for leg in self.legs.values() if leg.bridge_tag}
+        for order in target.pending_orders:
+            if order.leg_id or not order.bridge_tag:
+                continue
+            leg_id = leg_id_by_tag.get(order.bridge_tag)
+            if leg_id is not None:
+                orders_by_leg_id[leg_id] = order
         single_leg_by_source_order = self._single_leg_by_source_order()
         for order in target.pending_orders:
             if order.leg_id or order.source_order_id is None:
@@ -153,19 +181,30 @@ class IntentLedger:
         for leg_id, leg in tuple(self.legs.items()):
             order = orders_by_leg_id.get(leg_id)
             if order is not None:
+                state = TargetLegState.PARTIAL_FILL if order.quantity < leg.quantity else TargetLegState.ACTIVE
                 self.legs[leg_id] = replace(
                     leg,
-                    state=TargetLegState.ACTIVE,
+                    state=state,
                     target_order_ticket=order.ticket,
                 )
                 continue
 
             if leg.state == TargetLegState.CANCEL_PENDING:
                 self.legs[leg_id] = replace(leg, state=TargetLegState.CANCELLED, target_order_ticket=None)
+            elif leg.state in {TargetLegState.ACTIVE, TargetLegState.PARTIAL_FILL}:
+                intent = self.intents.get(leg.intent_id)
+                state = TargetLegState.CANCELLED if intent is not None and intent.state == IntentState.RETIRED else TargetLegState.MISSING_ON_TARGET
+                self.legs[leg_id] = replace(leg, state=state, target_order_ticket=None)
 
     def has_unresolved_leg(self) -> bool:
         return any(
-            leg.state in {TargetLegState.CREATE_PENDING, TargetLegState.CANCEL_PENDING, TargetLegState.UNKNOWN}
+            leg.state
+            in {
+                TargetLegState.CREATE_PENDING,
+                TargetLegState.CANCEL_PENDING,
+                TargetLegState.MISSING_ON_TARGET,
+                TargetLegState.UNKNOWN,
+            }
             for leg in self.legs.values()
         )
 
@@ -176,7 +215,7 @@ class IntentLedger:
         )
 
     def has_unknown_leg(self) -> bool:
-        return any(leg.state == TargetLegState.UNKNOWN for leg in self.legs.values())
+        return any(leg.state in {TargetLegState.UNKNOWN, TargetLegState.MISSING_ON_TARGET} for leg in self.legs.values())
 
     def active_or_pending_legs(self, intent_id: str) -> tuple[TargetLeg, ...]:
         return tuple(
@@ -202,3 +241,36 @@ class IntentLedger:
         if leg is None:
             raise KeyError(f"unknown target leg: {leg_id}")
         return leg
+
+
+def _bridge_tag(leg_id: str) -> str:
+    """Fits in the short MT5 order-comment payload with the AB2 prefix."""
+
+    return blake2s(leg_id.encode("utf-8"), digest_size=8).hexdigest()
+
+
+def _layout_matches(legs: tuple[TargetLeg, ...], specs: tuple[TargetLegSpec, ...]) -> bool:
+    return len(legs) == len(specs) and all(_matches_spec(leg, spec) for leg, spec in zip(legs, specs, strict=True))
+
+
+def _matches_spec(leg: TargetLeg, spec: TargetLegSpec) -> bool:
+    return (
+        leg.role == spec.role
+        and leg.side == spec.side
+        and leg.order_type == spec.order_type
+        and leg.quantity == spec.quantity
+        and leg.price == spec.price
+        and leg.trigger_price == spec.trigger_price
+    )
+
+
+def _replace_spec(leg: TargetLeg, spec: TargetLegSpec) -> TargetLeg:
+    return replace(
+        leg,
+        role=spec.role,
+        side=spec.side,
+        order_type=spec.order_type,
+        quantity=spec.quantity,
+        price=spec.price,
+        trigger_price=spec.trigger_price,
+    )

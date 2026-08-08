@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import timedelta
+from time import monotonic
 from typing import Protocol
 
 from .intent_ledger import IntentLedger
@@ -10,13 +12,18 @@ from .models import (
     CommandType,
     CoordinationResult,
     ExecutionReceipt,
+    IntentState,
+    OperationRecord,
     OperationStatus,
     SequenceStatus,
     SourceEvent,
     SourceEventType,
     SourceSymbolState,
     TargetAccountState,
+    TargetLegState,
 )
+from .operation_book import OperationBook
+from .persistence import BridgeStateStore, NullBridgeStateStore
 from .source_state import SourceStateBook
 
 
@@ -57,12 +64,12 @@ class ObserveOnlyPolicy:
 
 @dataclass
 class SymbolCoordinator:
-    """Serialized coordinator for exactly one ATAS/MT5 symbol pair.
+    """Durable serialized coordinator for exactly one ATAS/MT5 symbol pair.
 
-    Host code must call this object from one worker. Target connectivity errors
-    and unknown command outcomes never escape as an unhandled exception and
-    never trigger blind retries. A complete MT5 snapshot is the only way to
-    clear an unknown outcome.
+    All target commands, including market reconciliation and ticket-specific
+    close commands, enter a persisted operation state before dispatch. A new
+    command cannot be emitted until a complete target snapshot or transaction
+    proves the preceding command's result.
     """
 
     source_symbol: str
@@ -71,17 +78,48 @@ class SymbolCoordinator:
     policy: CopyPolicy = field(default_factory=ObserveOnlyPolicy)
     source_book: SourceStateBook = field(init=False)
     ledger: IntentLedger = field(default_factory=IntentLedger)
+    operation_book: OperationBook = field(default_factory=OperationBook)
     journal: OperationJournal = field(default_factory=InMemoryOperationJournal)
+    state_store: BridgeStateStore = field(default_factory=NullBridgeStateStore)
+    operation_confirmation_timeout: timedelta = timedelta(seconds=5)
     reconciliation_required: bool = False
     _target_unavailable_reason: str | None = field(default=None, init=False)
-    _unresolved_nonleg_command_ids: set[str] = field(default_factory=set, init=False)
+    _last_quote_checkpoint_at: float = field(default=0.0, init=False)
+    _last_market_state_persist_at: float = field(default=0.0, init=False)
+    quote_checkpoint_interval_seconds: float = 1.0
+    market_state_persist_interval_seconds: float = 5.0
 
     def __post_init__(self) -> None:
         self.source_book = SourceStateBook(source_symbol=self.source_symbol)
+        checkpoint = self.state_store.load_source_state(self.source_symbol)
+        if checkpoint is not None:
+            self.source_book.restore(checkpoint)
+        persisted_ledger = self.state_store.load_ledger(self.target_symbol)
+        if persisted_ledger is not None:
+            self.ledger = persisted_ledger
+        recovery_write_failed = False
+        if checkpoint is not None:
+            # A process can fail after the source checkpoint commit but before
+            # its ledger commit. Rebuilding the source projection at startup
+            # keeps that window conservative and self-healing.
+            self.ledger.synchronize_source(checkpoint)
+            try:
+                self.state_store.save_ledger(self.target_symbol, self.ledger)
+            except Exception:
+                recovery_write_failed = True
+        self.operation_book.restore(self.state_store.load_operations(self.target_symbol))
+        self.reconciliation_required = recovery_write_failed or self._requires_operator_action() or self.operation_book.has_in_flight()
 
     def handle(self, event: SourceEvent) -> CoordinationResult:
         sequence_status = self.source_book.apply(event)
         state = self.source_book.snapshot()
+        if not self._persist_source(event, state):
+            return CoordinationResult(
+                sequence_status=sequence_status,
+                source_state=state,
+                reconciliation_required=True,
+                reason="durable state store failed; target execution is blocked",
+            )
         if sequence_status != SequenceStatus.APPLIED:
             return CoordinationResult(
                 sequence_status=sequence_status,
@@ -90,144 +128,277 @@ class SymbolCoordinator:
                 reason="source event was not safe to plan",
             )
 
-        # Keep the source intent graph current before touching the target. That
-        # means a target-network outage cannot erase a source cancellation.
+        # Keep the source intent graph current before touching the target. A
+        # target-network outage therefore cannot erase an ATAS cancellation.
         self.ledger.synchronize_source(state)
+        if not self._persist_ledger():
+            return CoordinationResult(
+                sequence_status=sequence_status,
+                source_state=state,
+                reconciliation_required=True,
+                reason="intent ledger persistence failed; target execution is blocked",
+            )
 
+        # Quotes and lifecycle notices take part in sequence validation but do
+        # not themselves cause a trading plan in this first runtime.
         if event.event_type == SourceEventType.AUXILIARY:
+            target = self._read_target_state()
+            observer = getattr(self.policy, "observe_market_data", None)
+            if target is not None and callable(observer):
+                observer(state, target)
+                if not self._persist_market_state():
+                    self.reconciliation_required = True
             return CoordinationResult(
                 sequence_status=sequence_status,
                 source_state=state,
                 reconciliation_required=self.reconciliation_required,
                 reason="auxiliary event recorded for sequence continuity",
             )
+        return self._plan_from_current_state(sequence_status, state)
 
+    def handle_target_observation(self) -> CoordinationResult | None:
+        """Re-plan from the latest ATAS state after an MT5 transaction/snapshot."""
+
+        if not self.source_book.has_synchronized_snapshot:
+            # MT5 may start before ATAS. Cache its snapshot in the gateway but
+            # never manufacture a source state or plan a target command.
+            return None
+        state = self.source_book.snapshot()
+        return self._plan_from_current_state(SequenceStatus.APPLIED, state)
+
+    def handle_target_receipt(self, receipt: ExecutionReceipt) -> None:
+        """Persist the MT5 EA delivery receipt without treating it as fill proof."""
+
+        try:
+            operation = self.operation_book.apply_receipt(receipt)
+        except KeyError:
+            self.reconciliation_required = True
+            return
+        self._apply_receipt(operation.command, receipt)
+        if not self._persist_ledger_and_operations((operation,)):
+            self.reconciliation_required = True
+            return
+        if receipt.status in {OperationStatus.FAILED, OperationStatus.UNKNOWN}:
+            self.reconciliation_required = True
+
+    def check_operation_timeouts(self) -> bool:
+        """Expire stalled operations even if the MT5 EA stops publishing."""
+
+        expired = self.operation_book.expire_unconfirmed(self.operation_confirmation_timeout)
+        if not expired:
+            return False
+        if not self._persist_ledger_and_operations(expired):
+            self.reconciliation_required = True
+            return True
+        self.reconciliation_required = True
+        return True
+
+    def confirm_no_effect_after_operator_check(self, command_id: str) -> CoordinationResult | None:
+        """Release one unknown request only after an operator checked MT5.
+
+        The caller must have verified that the terminal's latest complete
+        snapshot has no effect from this command.  This is the deliberate
+        escape hatch for an ambiguous broker/network outcome; it is never
+        called automatically.
+        """
+
+        if not self.source_book.has_synchronized_snapshot:
+            return None
         target = self._read_target_state()
         if target is None:
             self.reconciliation_required = True
-            return CoordinationResult(
-                sequence_status=sequence_status,
-                source_state=state,
-                reconciliation_required=True,
-                reason=self._target_unavailable_reason,
-            )
+            return None
+        if not self._apply_observed_target(target):
+            self.reconciliation_required = True
+            return None
 
-        self.ledger.synchronize_target(target)
-        self.reconciliation_required = self._ledger_requires_operator()
-        if self._has_blocking_uncertainty():
-            return CoordinationResult(
-                sequence_status=sequence_status,
-                source_state=state,
-                reconciliation_required=True,
-                reason="target command outcome is unresolved; complete snapshot required",
-            )
+        record = self.operation_book.records.get(command_id)
+        if record is None:
+            raise KeyError(f"unknown operation: {command_id}")
+        if record.resolved_at_utc is not None:
+            return self._plan_from_current_state(SequenceStatus.APPLIED, self.source_book.snapshot())
 
-        commands = self._limit_in_flight_risk(
-            self.policy.plan(state, target, self.ledger),
-            risk_command_in_flight=self.ledger.has_in_flight_leg(),
-        )
-        receipts: list[ExecutionReceipt] = []
-        for command in commands:
-            self._mark_command_dispatched(command)
-            receipt = self._execute_safely(command)
-            self.journal.record(command, receipt)
-            self._apply_receipt(command, receipt)
-            receipts.append(receipt)
-            if receipt.status in {OperationStatus.FAILED, OperationStatus.UNKNOWN}:
-                self.reconciliation_required = True
-                # A fresh snapshot is attempted immediately, but a missing or
-                # ambiguous result is never retried from this call.
-                self._read_target_state_and_reconcile_ledger()
-                break
-
-        return CoordinationResult(
-            sequence_status=sequence_status,
-            source_state=state,
-            commands=commands[: len(receipts)],
-            receipts=tuple(receipts),
-            reconciliation_required=self.reconciliation_required,
-            reason="target execution uncertainty" if self.reconciliation_required else None,
-        )
+        released = self.operation_book.confirm_no_effect(command_id)
+        self._rearm_leg_after_no_effect(released.command)
+        if not self._persist_ledger_and_operations((released,)):
+            self.reconciliation_required = True
+            return None
+        self.reconciliation_required = False
+        return self._plan_from_current_state(SequenceStatus.APPLIED, self.source_book.snapshot())
 
     def reconcile_target(self) -> bool:
-        """Refresh target state after an MT5 transaction or timeout.
-
-        Returns true only when a complete target snapshot proves there is no
-        unknown/failed leg. It does not manufacture a retry.
-        """
+        """Refresh target state without dispatching a follow-on command."""
 
         target = self._read_target_state()
         if target is None:
             self.reconciliation_required = True
             return False
-        self.ledger.synchronize_target(target)
-        self.reconciliation_required = self._ledger_requires_operator()
-        return not self.reconciliation_required
+        if not self._apply_observed_target(target):
+            self.reconciliation_required = True
+            return False
+        self.reconciliation_required = self._requires_operator_action()
+        return not self.reconciliation_required and not self.operation_book.has_in_flight()
 
-    def handle_target_observation(self) -> CoordinationResult:
-        """Plan from the latest ATAS state after an MT5 transaction/snapshot.
-
-        This is the entry point a future MQL5 ``OnTradeTransaction`` observer
-        calls. It is essential when a source cancellation arrived while a prior
-        target create was still awaiting confirmation: once the target order is
-        observable, the cancellation can be sent without waiting for another
-        ATAS event.
-        """
-
-        state = self.source_book.snapshot()
+    def _plan_from_current_state(
+        self,
+        sequence_status: SequenceStatus,
+        state: SourceSymbolState,
+    ) -> CoordinationResult:
         target = self._read_target_state()
         if target is None:
             self.reconciliation_required = True
             return CoordinationResult(
-                sequence_status=SequenceStatus.APPLIED,
+                sequence_status=sequence_status,
                 source_state=state,
                 reconciliation_required=True,
                 reason=self._target_unavailable_reason,
             )
-        self.ledger.synchronize_target(target)
-        self.reconciliation_required = self._ledger_requires_operator()
-        if self._has_blocking_uncertainty():
+        if not self._apply_observed_target(target):
+            self.reconciliation_required = True
             return CoordinationResult(
-                sequence_status=SequenceStatus.APPLIED,
+                sequence_status=sequence_status,
                 source_state=state,
                 reconciliation_required=True,
-                reason="target command outcome is unresolved; complete snapshot required",
+                reason="target observation could not be persisted",
             )
 
-        commands = self._limit_in_flight_risk(
-            self.policy.plan(state, target, self.ledger),
-            risk_command_in_flight=self.ledger.has_in_flight_leg(),
-        )
-        receipts: list[ExecutionReceipt] = []
-        for command in commands:
-            self._mark_command_dispatched(command)
-            receipt = self._execute_safely(command)
-            self.journal.record(command, receipt)
-            self._apply_receipt(command, receipt)
-            receipts.append(receipt)
-            if receipt.status in {OperationStatus.FAILED, OperationStatus.UNKNOWN}:
-                self.reconciliation_required = True
-                self._read_target_state_and_reconcile_ledger()
-                break
+        self.reconciliation_required = self._requires_operator_action()
+        if self.reconciliation_required:
+            return CoordinationResult(
+                sequence_status=sequence_status,
+                source_state=state,
+                reconciliation_required=True,
+                reason="target command outcome requires operator reconciliation",
+            )
+        if self.operation_book.has_in_flight():
+            return CoordinationResult(
+                sequence_status=sequence_status,
+                source_state=state,
+                reconciliation_required=False,
+                reason="waiting for target snapshot to confirm prior command",
+            )
+
+        commands = self.policy.plan(state, target, self.ledger)
+        if not self._persist_market_state():
+            self.reconciliation_required = True
+            return CoordinationResult(
+                sequence_status=sequence_status,
+                source_state=state,
+                reconciliation_required=True,
+                reason="market-state persistence failed; target execution is blocked",
+            )
+        command = self._select_next_command(commands)
+        if command is None:
+            return CoordinationResult(sequence_status=sequence_status, source_state=state)
+        command = self.operation_book.allocate_attempt(command)
+        receipt = self._dispatch(command)
         return CoordinationResult(
-            sequence_status=SequenceStatus.APPLIED,
+            sequence_status=sequence_status,
             source_state=state,
-            commands=commands[: len(receipts)],
-            receipts=tuple(receipts),
+            commands=(command,),
+            receipts=(receipt,),
             reconciliation_required=self.reconciliation_required,
-            reason="target execution uncertainty" if self.reconciliation_required else "target observation reconciled",
+            reason="target execution uncertainty" if self.reconciliation_required else None,
         )
 
-    def _read_target_state_and_reconcile_ledger(self) -> None:
-        target = self._read_target_state()
-        if target is not None:
-            self.ledger.synchronize_target(target)
-            self.reconciliation_required = self._ledger_requires_operator()
+    def _dispatch(self, command: BridgeCommand) -> ExecutionReceipt:
+        # Write-ahead persistence is a hard precondition to an MT5 request.
+        operation = self.operation_book.dispatch(command)
+        self._mark_command_dispatched(command)
+        if not self._persist_ledger_and_operations((operation,)):
+            self.reconciliation_required = True
+            return ExecutionReceipt(
+                command_id=command.command_id,
+                status=OperationStatus.UNKNOWN,
+                message="operation dispatch and target leg state were not durably recorded",
+            )
+        receipt = self._execute_safely(command)
+        self.journal.record(command, receipt)
+        operation = self.operation_book.apply_receipt(receipt)
+        self._apply_receipt(command, receipt)
+        if not self._persist_ledger_and_operations((operation,)):
+            self.reconciliation_required = True
+        if receipt.status in {OperationStatus.FAILED, OperationStatus.UNKNOWN}:
+            self.reconciliation_required = True
+        return receipt
+
+    def _apply_observed_target(self, target: TargetAccountState) -> bool:
+        self.ledger.synchronize_target(target)
+        expired = self.operation_book.expire_unconfirmed(self.operation_confirmation_timeout)
+        resolved = self.operation_book.resolve_from_snapshot(target, self.ledger)
+        for record in resolved:
+            command = record.command
+            if command.command_type == CommandType.CANCEL_PENDING and command.leg_id is not None:
+                leg = self.ledger.get_leg(command.leg_id)
+                if leg is not None:
+                    self.ledger.update_leg(replace(leg, state=TargetLegState.CANCELLED, target_order_ticket=None))
+        try:
+            self.state_store.save_ledger_and_operations(self.target_symbol, self.ledger, (*expired, *resolved))
+        except Exception:
+            return False
+        return True
+
+    def _persist_source(self, event: SourceEvent, state: SourceSymbolState) -> bool:
+        is_quote = event.event_type == SourceEventType.AUXILIARY and event.quote is not None
+        now = monotonic()
+        if is_quote and now - self._last_quote_checkpoint_at < self.quote_checkpoint_interval_seconds:
+            # Raw probe JSONL retains every quote for measurement. SQLite only
+            # needs a recent quote checkpoint for restart recovery; making it
+            # transactional at 20 Hz would delay order processing and bloat
+            # the WAL without improving trading correctness.
+            return True
+        try:
+            if not is_quote:
+                self.state_store.record_source_event(event)
+            self.state_store.save_source_state(state)
+        except Exception:
+            return False
+        if is_quote:
+            self._last_quote_checkpoint_at = now
+        return True
+
+    def _persist_ledger(self) -> bool:
+        try:
+            self.state_store.save_ledger(self.target_symbol, self.ledger)
+        except Exception:
+            return False
+        return True
+
+    def _persist_operation(self, operation: OperationRecord) -> bool:
+        try:
+            self.state_store.save_operation(operation)
+        except Exception:
+            return False
+        return True
+
+    def _persist_ledger_and_operations(self, operations: tuple[OperationRecord, ...]) -> bool:
+        try:
+            self.state_store.save_ledger_and_operations(self.target_symbol, self.ledger, operations)
+        except Exception:
+            return False
+        return True
+
+    def _persist_market_state(self) -> bool:
+        exporter = getattr(self.policy, "export_market_state", None)
+        if not callable(exporter):
+            return True
+        payload = exporter()
+        if payload is None:
+            return True
+        now = monotonic()
+        if now - self._last_market_state_persist_at < self.market_state_persist_interval_seconds:
+            return True
+        try:
+            self.state_store.save_market_state(self.target_symbol, payload)
+        except Exception:
+            return False
+        self._last_market_state_persist_at = now
+        return True
 
     def _read_target_state(self) -> TargetAccountState | None:
         try:
             target = self.execution_port.read_state(self.target_symbol)
-        except Exception as error:  # boundary: MT5 terminal/network may disappear
+        except Exception as error:  # MT5 terminal/network may disappear
             self._target_unavailable_reason = f"target snapshot unavailable: {type(error).__name__}: {error}"
             return None
         if target.target_symbol != self.target_symbol:
@@ -235,6 +406,9 @@ class SymbolCoordinator:
             return None
         if not target.snapshot_complete:
             self._target_unavailable_reason = "target adapter returned an incomplete snapshot"
+            return None
+        if target.foreign_symbol_objects_present:
+            self._target_unavailable_reason = "foreign/manual target-symbol objects detected; bridge is quarantined"
             return None
         self._target_unavailable_reason = None
         return target
@@ -266,36 +440,46 @@ class SymbolCoordinator:
 
     def _apply_receipt(self, command: BridgeCommand, receipt: ExecutionReceipt) -> None:
         if command.leg_id is None:
-            if receipt.status in {OperationStatus.FAILED, OperationStatus.UNKNOWN}:
-                self._unresolved_nonleg_command_ids.add(command.command_id)
             return
         if receipt.status == OperationStatus.FAILED:
             self.ledger.mark_leg_failed(command.leg_id)
         elif receipt.status == OperationStatus.UNKNOWN:
             self.ledger.mark_leg_unknown(command.leg_id)
 
-    def _has_blocking_uncertainty(self) -> bool:
-        return self.reconciliation_required or self._ledger_requires_operator()
+    def _rearm_leg_after_no_effect(self, command: BridgeCommand) -> None:
+        """Restore the desired leg state after a verified no-effect outcome."""
 
-    def _ledger_requires_operator(self) -> bool:
-        return bool(self._unresolved_nonleg_command_ids) or self.ledger.has_unknown_leg() or any(
-            leg.state.value == "failed" for leg in self.ledger.legs.values()
+        if command.leg_id is None:
+            return
+        leg = self.ledger.get_leg(command.leg_id)
+        if leg is None:
+            return
+        intent = self.ledger.intents.get(leg.intent_id)
+        if command.command_type == CommandType.CREATE_PENDING:
+            if leg.state in {TargetLegState.ACTIVE, TargetLegState.PARTIAL_FILL}:
+                raise ValueError("target snapshot shows the supposedly absent pending order")
+            state = TargetLegState.DESIRED if intent is not None and intent.state == IntentState.ACTIVE else TargetLegState.CANCELLED
+            self.ledger.update_leg(replace(leg, state=state, target_order_ticket=None))
+        elif command.command_type == CommandType.CANCEL_PENDING:
+            state = TargetLegState.ACTIVE if leg.target_order_ticket is not None else TargetLegState.CANCELLED
+            self.ledger.update_leg(replace(leg, state=state))
+
+    def _requires_operator_action(self) -> bool:
+        return self.operation_book.has_unknown() or self.operation_book.has_failed() or self.ledger.has_unknown_leg() or any(
+            leg.state == TargetLegState.FAILED for leg in self.ledger.legs.values()
         )
 
     @staticmethod
-    def _limit_in_flight_risk(
-        commands: tuple[BridgeCommand, ...],
-        *,
-        risk_command_in_flight: bool,
-    ) -> tuple[BridgeCommand, ...]:
-        """Keep cancellation/reduction priority while allowing one new-risk command."""
+    def _select_next_command(commands: tuple[BridgeCommand, ...]) -> BridgeCommand | None:
+        """One command at a time per symbol; cancellation/reduction wins."""
 
-        selected: list[BridgeCommand] = []
-        risk_increasing_in_flight = risk_command_in_flight
-        for command in commands:
-            if command.increases_risk:
-                if risk_increasing_in_flight:
-                    continue
-                risk_increasing_in_flight = True
-            selected.append(command)
-        return tuple(selected)
+        priority = {
+            CommandType.CANCEL_PENDING: 0,
+            CommandType.CLOSE_POSITION: 1,
+            CommandType.EXECUTE_MARKET: 2,
+            CommandType.MODIFY_POSITION_PROTECTION: 3,
+            CommandType.CREATE_PENDING: 4,
+            CommandType.MODIFY_PENDING: 5,
+            CommandType.RECONCILE: 6,
+        }
+        return min(commands, key=lambda command: priority[command.command_type]) if commands else None

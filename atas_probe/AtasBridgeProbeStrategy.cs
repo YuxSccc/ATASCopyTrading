@@ -24,7 +24,13 @@ namespace AtasMt5ProbeStrategy
         private ProbeWebSocketClient? _client;
         private string _sessionId = "";
         private long _eventSequence;
+        private readonly object _outboxLock = new object();
+        private Task _outboxTail = Task.CompletedTask;
+        private int _outboxBacklog;
+        private long _droppedQuoteEvents;
+        private long _latestCriticalEventId;
         private long _lastQuoteTicks;
+        private long _lastRecoverySnapshotTicks;
         private decimal? _lastCapturedPositionVolume;
         private decimal? _lastCapturedAveragePrice;
         private object? _lastObservedPositionData;
@@ -58,15 +64,27 @@ namespace AtasMt5ProbeStrategy
         [DisplayName("Capture unchanged position callbacks")]
         public bool CaptureUnchangedPositions { get; set; } = true;
 
+        [OFT.Attributes.ParameterAttribute]
+        [DisplayName("Recovery snapshot interval ms")]
+        public int RecoverySnapshotIntervalMilliseconds { get; set; } = 1000;
+
+        [OFT.Attributes.ParameterAttribute]
+        [DisplayName("Maximum queued quote events")]
+        public int MaximumQueuedQuoteEvents { get; set; } = 20;
+
         protected override void OnStarted()
         {
             _disposed = false;
             _sessionId = Guid.NewGuid().ToString("N");
             _eventSequence = 0;
             _lastQuoteTicks = 0;
+            _lastRecoverySnapshotTicks = 0;
             _lastCapturedPositionVolume = null;
             _lastCapturedAveragePrice = null;
             _lastObservedPositionData = null;
+            _outboxBacklog = 0;
+            _droppedQuoteEvents = 0;
+            _latestCriticalEventId = 0;
             _client = new ProbeWebSocketClient(ServerUrl);
             StrategyLog.Append(
                 $"Started bridge probe build={BuildTag}, session={_sessionId}, source={GetSourceSymbol()}, " +
@@ -88,6 +106,7 @@ namespace AtasMt5ProbeStrategy
             _lastCapturedAveragePrice = position.AveragePrice;
             _lastObservedPositionData = BuildPositionData(position);
             Emit("position_changed", _lastObservedPositionData);
+            MaybeEmitRecoverySnapshot(force: true);
         }
 
         protected override void OnNewOrder(Order order)
@@ -96,6 +115,7 @@ namespace AtasMt5ProbeStrategy
                 return;
 
             Emit("order_new", BuildOrderData(order));
+            MaybeEmitRecoverySnapshot(force: true);
         }
 
         protected override void OnOrderChanged(Order order)
@@ -104,6 +124,7 @@ namespace AtasMt5ProbeStrategy
                 return;
 
             Emit("order_changed", BuildOrderData(order));
+            MaybeEmitRecoverySnapshot(force: true);
         }
 
         protected override void OnBestBidAskChanged(MarketDataArg depth)
@@ -122,6 +143,7 @@ namespace AtasMt5ProbeStrategy
                 best_bid = BestBid == null ? (decimal?)null : BestBid.Price,
                 best_ask = BestAsk == null ? (decimal?)null : BestAsk.Price,
             });
+            MaybeEmitRecoverySnapshot();
         }
 
         protected override void OnCalculate(int bar, decimal value)
@@ -158,6 +180,7 @@ namespace AtasMt5ProbeStrategy
                 Emit("state_snapshot", new
                 {
                     last_observed_position = _lastObservedPositionData,
+                    position_known = _lastObservedPositionData != null,
                     orders,
                 });
             }
@@ -181,47 +204,129 @@ namespace AtasMt5ProbeStrategy
 
         private void Emit(string eventType, object data)
         {
-            var message = new ProbeEnvelope
+            lock (_outboxLock)
             {
-                SessionId = _sessionId,
-                EventId = Interlocked.Increment(ref _eventSequence),
-                EventType = eventType,
-                SourceSymbol = GetSourceSymbol(),
-                AtasTimestampUtc = DateTimeOffset.UtcNow.ToString("O"),
-                LocalMonotonicTicks = Stopwatch.GetTimestamp(),
-                LocalStopwatchFrequency = Stopwatch.Frequency,
-                DeliveryMode = NormalizedDeliveryMode(),
-                Data = data,
-            };
-            _ = SendEventAsync(message);
+                if (string.Equals(eventType, "quote", StringComparison.Ordinal)
+                    && Volatile.Read(ref _outboxBacklog) >= Math.Max(1, MaximumQueuedQuoteEvents))
+                {
+                    // Quotes are observational. Dropping them during an
+                    // outage is safe because the next state_snapshot is
+                    // authoritative, whereas unbounded quote backlog would
+                    // delay order/position events after reconnect.
+                    Interlocked.Increment(ref _droppedQuoteEvents);
+                    return;
+                }
+
+                var message = new ProbeEnvelope
+                {
+                    SessionId = _sessionId,
+                    EventId = ++_eventSequence,
+                    EventType = eventType,
+                    SourceSymbol = GetSourceSymbol(),
+                    AtasTimestampUtc = DateTimeOffset.UtcNow.ToString("O"),
+                    LocalMonotonicTicks = Stopwatch.GetTimestamp(),
+                    LocalStopwatchFrequency = Stopwatch.Frequency,
+                    DeliveryMode = NormalizedDeliveryMode(),
+                    Data = data,
+                };
+                if (IsCriticalEvent(eventType))
+                    Interlocked.Exchange(ref _latestCriticalEventId, message.EventId);
+
+                // ATAS callbacks can arrive close together. A task per event
+                // races for the WebSocket send lock and can invert event IDs.
+                // This single tail preserves source order without blocking the
+                // callback thread on I/O or acknowledgement latency.
+                Interlocked.Increment(ref _outboxBacklog);
+                _outboxTail = _outboxTail
+                    .ContinueWith(
+                        async _ =>
+                        {
+                            try
+                            {
+                                await SendEventAsync(message);
+                            }
+                            finally
+                            {
+                                Interlocked.Decrement(ref _outboxBacklog);
+                            }
+                        },
+                        CancellationToken.None,
+                        TaskContinuationOptions.None,
+                        TaskScheduler.Default)
+                    .Unwrap();
+            }
         }
 
         private async Task SendEventAsync(ProbeEnvelope message)
         {
-            try
+            while (!_disposed)
             {
-                if (_client == null)
-                    return;
-
-                var sentAt = Stopwatch.GetTimestamp();
-                var acknowledgement = await _client.SendAsync(
-                    message,
-                    message.DeliveryMode == "sync",
-                    AcknowledgementTimeoutMilliseconds);
-                if (message.DeliveryMode == "sync")
+                try
                 {
-                    var elapsedMilliseconds = (Stopwatch.GetTimestamp() - sentAt) * 1000.0 / Stopwatch.Frequency;
-                    StrategyLog.Append(
-                        acknowledgement == null
-                            ? $"Probe sync acknowledgement missing event={message.EventId}, elapsed_ms={elapsedMilliseconds:F3}\n"
-                            : $"Probe sync acknowledgement event={message.EventId}, elapsed_ms={elapsedMilliseconds:F3}, " +
-                              $"server_received={acknowledgement.ServerReceivedUtc}\n");
+                    if (string.Equals(message.EventType, "quote", StringComparison.Ordinal)
+                        && message.EventId < Interlocked.Read(ref _latestCriticalEventId))
+                        return;
+                    if (_client == null)
+                        return;
+
+                    var sentAt = Stopwatch.GetTimestamp();
+                    // Acknowledgement is awaited only by this background
+                    // outbox. The ATAS callback never waits, but no event is
+                    // allowed to overtake or be forgotten after a disconnect.
+                    var acknowledgement = await _client.SendAsync(
+                        message,
+                        true,
+                        string.Equals(message.EventType, "quote", StringComparison.Ordinal)
+                            ? Math.Min(50, Math.Max(10, AcknowledgementTimeoutMilliseconds))
+                            : AcknowledgementTimeoutMilliseconds);
+                    if (acknowledgement != null)
+                    {
+                        if (message.DeliveryMode == "sync")
+                        {
+                            var elapsedMilliseconds = (Stopwatch.GetTimestamp() - sentAt) * 1000.0 / Stopwatch.Frequency;
+                            StrategyLog.Append(
+                                $"Probe sync acknowledgement event={message.EventId}, elapsed_ms={elapsedMilliseconds:F3}, " +
+                                $"server_received={acknowledgement.ServerReceivedUtc}\n");
+                        }
+                        return;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    StrategyLog.Append($"Probe event send error event={message.EventId}: {ex.Message}\n");
+                }
+
+                try
+                {
+                    await Task.Delay(100);
+                }
+                catch
+                {
+                    return;
                 }
             }
-            catch (Exception ex)
+        }
+
+        private void MaybeEmitRecoverySnapshot(bool force = false)
+        {
+            var now = Stopwatch.GetTimestamp();
+            var minimumTicks = Stopwatch.Frequency * Math.Max(100, RecoverySnapshotIntervalMilliseconds) / 1000;
+            var previous = Interlocked.Read(ref _lastRecoverySnapshotTicks);
+            if (!force && now - previous < minimumTicks)
+                return;
+
+            Interlocked.Exchange(ref _lastRecoverySnapshotTicks, now);
+            var orders = Orders
+                .Where(order => IsCurrentChartSecurity(order.Security?.ToString()))
+                .Select(BuildOrderData)
+                .ToArray();
+            Emit("state_snapshot", new
             {
-                StrategyLog.Append($"Probe event send error event={message.EventId}: {ex.Message}\n");
-            }
+                last_observed_position = _lastObservedPositionData,
+                position_known = _lastObservedPositionData != null,
+                orders,
+                dropped_quote_events = Interlocked.Read(ref _droppedQuoteEvents),
+            });
         }
 
         private object BuildPositionData(Position position)
@@ -282,6 +387,13 @@ namespace AtasMt5ProbeStrategy
             return string.Equals(DeliveryMode?.Trim(), "sync", StringComparison.OrdinalIgnoreCase)
                 ? "sync"
                 : "async";
+        }
+
+        private static bool IsCriticalEvent(string eventType)
+        {
+            return string.Equals(eventType, "order_new", StringComparison.Ordinal)
+                || string.Equals(eventType, "order_changed", StringComparison.Ordinal)
+                || string.Equals(eventType, "position_changed", StringComparison.Ordinal);
         }
 
         private void StopProbe()
