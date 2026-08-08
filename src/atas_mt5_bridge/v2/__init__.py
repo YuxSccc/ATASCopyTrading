@@ -1,7 +1,5 @@
-"""Version 2 bridge boundaries.
+"""Safety-first ATAS-authoritative bridge core and non-live simulator.
 
-This package intentionally contains no MT5 implementation or copy policy.
-It provides the ordered source-state and execution boundaries needed to add
-those components safely later.
+The package has no live MT5 adapter. Its executable policy is inert by
+default and is enabled only by the in-process simulator used for tests.
 """
-

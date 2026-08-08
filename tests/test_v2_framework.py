@@ -39,7 +39,7 @@ class FakeExecutionPort:
 
 
 class OneCommandPolicy:
-    def plan(self, source, target) -> tuple[BridgeCommand, ...]:
+    def plan(self, source, target, ledger) -> tuple[BridgeCommand, ...]:
         return (
             BridgeCommand(
                 command_id=f"command-{source.last_event_id}",

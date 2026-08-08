@@ -1,7 +1,8 @@
 # Bridge V2: Integration Boundaries
 
-This design defines integration boundaries only. It deliberately does not
-define position-copying, price-conversion, or reconciliation rules yet.
+This design defines the integration boundaries for the implemented safe bridge
+core. Live MT5 execution, price conversion, and broker-specific validation are
+deliberately still outside the executable runtime.
 
 ## Boundaries
 
@@ -68,15 +69,21 @@ only after the observed data supports it.
 
 ## Implemented safe framework
 
-The initial framework is in `src/atas_mt5_bridge/v2/`. It is deliberately
-separate from the legacy target-net bridge and is not connected to an MT5
-adapter or server command yet.
+The framework is in `src/atas_mt5_bridge/v2/`. It is deliberately separate
+from the legacy target-net bridge and is not connected to a live MT5 adapter.
 
 - `atas_adapter.py` converts probe messages to a canonical source event.
 - `source_state.py` maintains the current ATAS position and active order
   instances for one symbol.
-- `coordinator.py` defines the one-worker execution boundary and an
-  observe-only default policy.
+- `intent_ledger.py` maintains ATAS source intents and their `1..N` target
+  legs without inferring replacement orders by timing or price.
+- `policy.py` contains the ATAS-authoritative net-equivalent policy. It is
+  disabled by default and does not send commands unless explicitly enabled by
+  a non-live simulator.
+- `coordinator.py` defines the one-worker execution boundary, in-flight risk
+  limit, unknown-outcome block, and MT5-observer reconciliation entry point.
+- `simulation.py` and `runtime.py` run deterministic local tests through the
+  existing probe protocol; neither module can connect to MT5.
 
 An ATAS `Order.Id` is treated as an **order-instance ID**, not an intention
 ID. A cancellation followed by a new order is therefore represented as two
@@ -90,8 +97,9 @@ source snapshot is received.
 
 The execution port records `accepted`, `confirmed`, `failed`, and `unknown`
 separately. A failed or unknown target result blocks further automatic plans
-for that symbol and marks it as requiring reconciliation. This is the boundary
-where a later MT5 transaction observer and a compensation policy will attach.
+for that symbol and marks it as requiring reconciliation. A target observer
+can call `handle_target_observation()` after an MT5 transaction to finish a
+pending cancellation or repair without waiting for another ATAS event.
 
 `TargetAccountState` explicitly retains long and short quantities and the
 target account model (`netting` or `hedging`). Consequently, a later position

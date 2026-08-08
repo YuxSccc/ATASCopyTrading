@@ -30,6 +30,7 @@ class CommandType(str, Enum):
     CANCEL_PENDING = "cancel_pending"
     MODIFY_PENDING = "modify_pending"
     EXECUTE_MARKET = "execute_market"
+    CLOSE_POSITION = "close_position"
     MODIFY_POSITION_PROTECTION = "modify_position_protection"
     RECONCILE = "reconcile"
 
@@ -50,9 +51,34 @@ class SequenceStatus(str, Enum):
     SESSION_RESET = "session_reset"
 
 
+class IntentState(str, Enum):
+    ACTIVE = "active"
+    RETIRED = "retired"
+
+
+class TargetLegRole(str, Enum):
+    ENTRY_PENDING = "entry_pending"
+    REDUCE_PENDING = "reduce_pending"
+    PROTECTIVE_TP = "protective_tp"
+    PROTECTIVE_SL = "protective_sl"
+    MARKET_RECONCILE = "market_reconcile"
+    CLEANUP = "cleanup"
+
+
+class TargetLegState(str, Enum):
+    DESIRED = "desired"
+    CREATE_PENDING = "create_pending"
+    ACTIVE = "active"
+    CANCEL_PENDING = "cancel_pending"
+    CANCELLED = "cancelled"
+    FILLED = "filled"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True)
 class SourceOrder:
-    """A single ATAS order instance, not a user-level order intention.
+    """A single ATAS order instance, not a user-level trading intention.
 
     ATAS can represent a drag/move as a cancelled instance followed by a new
     instance. ``source_order_id`` therefore identifies only this instance.
@@ -121,6 +147,56 @@ class SourceSymbolState:
 
 
 @dataclass(frozen=True)
+class SourceOrderKey:
+    """Stable source-instance key. ExtId is intentionally not part of it."""
+
+    session_id: str
+    source_symbol: str
+    source_order_id: str
+
+    @property
+    def value(self) -> str:
+        return f"{self.session_id}:{self.source_symbol}:{self.source_order_id}"
+
+
+@dataclass(frozen=True)
+class BridgeIntent:
+    """One source order's desired target outcome, possibly implemented by many legs."""
+
+    intent_id: str
+    source_key: SourceOrderKey
+    order: SourceOrder
+    state: IntentState
+
+
+@dataclass(frozen=True)
+class TargetLeg:
+    """One target-side operation belonging to a source order intent."""
+
+    leg_id: str
+    intent_id: str
+    source_key: SourceOrderKey
+    role: TargetLegRole
+    side: str
+    order_type: str
+    quantity: Decimal
+    price: Decimal | None
+    trigger_price: Decimal | None
+    state: TargetLegState = TargetLegState.DESIRED
+    target_order_ticket: str | None = None
+    target_position_ticket: str | None = None
+
+    @property
+    def requires_target_order(self) -> bool:
+        return self.role in {
+            TargetLegRole.ENTRY_PENDING,
+            TargetLegRole.REDUCE_PENDING,
+            TargetLegRole.PROTECTIVE_TP,
+            TargetLegRole.PROTECTIVE_SL,
+        }
+
+
+@dataclass(frozen=True)
 class TargetOrderState:
     ticket: str
     side: str
@@ -129,15 +205,29 @@ class TargetOrderState:
     price: Decimal | None
     trigger_price: Decimal | None
     source_order_id: str | None = None
+    leg_id: str | None = None
+
+
+@dataclass(frozen=True)
+class TargetPositionState:
+    """A bridge-owned target position. HEDGING snapshots must include tickets."""
+
+    ticket: str
+    side: str
+    quantity: Decimal
 
 
 @dataclass(frozen=True)
 class TargetAccountState:
+    """Observed bridge-owned state only; unrelated manual MT5 objects stay outside it."""
+
     target_symbol: str
     model: TargetAccountModel
     long_quantity: Decimal
     short_quantity: Decimal
     pending_orders: tuple[TargetOrderState, ...] = ()
+    positions: tuple[TargetPositionState, ...] = ()
+    snapshot_complete: bool = True
 
     @property
     def net_quantity(self) -> Decimal:
@@ -155,7 +245,13 @@ class BridgeCommand:
     target_symbol: str
     source_event_id: int
     source_order_id: str | None = None
+    intent_id: str | None = None
+    leg_id: str | None = None
     payload: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def increases_risk(self) -> bool:
+        return self.command_type in {CommandType.CREATE_PENDING, CommandType.EXECUTE_MARKET}
 
 
 @dataclass(frozen=True)
