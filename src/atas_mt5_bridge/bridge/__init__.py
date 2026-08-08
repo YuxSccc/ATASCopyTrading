@@ -1,1 +1,0 @@
-"""Local bridge service layer."""
