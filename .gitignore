@@ -1,0 +1,16 @@
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+probe-data/
+*.log
+
+# Local runtime configuration
+config.local*.json
+
+# ATAS/.NET build artifacts
+**/bin/
+**/obj/
+
+# A probe DLL moved out of ATAS' Indicators folder during diagnosis
+atas_probe/disabled-indicator-copy/

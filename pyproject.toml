@@ -1,0 +1,12 @@
+[project]
+name = "atas-mt5-bridge"
+version = "0.1.0"
+description = "Safety-first ATAS to MT5 bridge framework and integration probe"
+requires-python = ">=3.10"
+
+[project.scripts]
+atas-mt5-probe-server = "atas_mt5_bridge.probe.server:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

@@ -1,0 +1,30 @@
+{
+  "bridge": {
+    "mode": "dry_run",
+    "kill_switch": false,
+    "magic": 880501,
+    "comment_prefix": "ATAS-MT5",
+    "reject_hedged_same_magic": true,
+    "allow_external_positions": false
+  },
+  "symbols": {
+    "COMEX Gold August 2026": {
+      "target_symbol": "XAUUSD",
+      "lot_ratio": "0.05",
+      "max_abs_target_lot": "1.00",
+      "max_order_lot": "0.20",
+      "volume_min": "0.01",
+      "volume_step": "0.01",
+      "volume_max": "1000000"
+    },
+    "E-mini NASDAQ-100 June 2026": {
+      "target_symbol": "USTEC",
+      "lot_ratio": "0.05",
+      "max_abs_target_lot": "1.00",
+      "max_order_lot": "0.20",
+      "volume_min": "0.01",
+      "volume_step": "0.01",
+      "volume_max": "1000000"
+    }
+  }
+}

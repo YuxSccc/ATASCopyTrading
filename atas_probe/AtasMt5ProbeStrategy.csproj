@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <Nullable>enable</Nullable>
+    <AssemblyName>AtasMt5ProbeStrategy</AssemblyName>
+    <RootNamespace>AtasMt5ProbeStrategy</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="ATAS.DataFeedsCore">
+      <HintPath>$(ATAS_HOME)\ATAS.DataFeedsCore.dll</HintPath>
+    </Reference>
+    <Reference Include="ATAS.Indicators">
+      <HintPath>$(ATAS_HOME)\ATAS.Indicators.dll</HintPath>
+    </Reference>
+    <Reference Include="ATAS.Strategies">
+      <HintPath>$(ATAS_HOME)\ATAS.Strategies.dll</HintPath>
+    </Reference>
+    <Reference Include="OFT.Attributes">
+      <HintPath>$(ATAS_HOME)\OFT.Attributes.dll</HintPath>
+    </Reference>
+    <Reference Include="Utils.Common">
+      <HintPath>$(ATAS_HOME)\Utils.Common.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+</Project>
