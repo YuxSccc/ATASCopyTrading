@@ -86,6 +86,23 @@ namespace AtasMt5ProbeStrategy
             _droppedQuoteEvents = 0;
             _latestCriticalEventId = 0;
             _client = new ProbeWebSocketClient(ServerUrl);
+
+            // ATAS does not guarantee an immediate OnPositionChanged callback
+            // when a chart strategy is attached to an already-flat chart.  A
+            // null position snapshot is deliberately treated as unsafe by the
+            // bridge, so seed the snapshot from the synchronous strategy value.
+            // Average price is unavailable for this startup read and is not
+            // required for authoritative net-position reconciliation.
+            var currentPosition = CurrentPosition;
+            _lastCapturedPositionVolume = currentPosition;
+            _lastObservedPositionData = new
+            {
+                security = Security?.ToString() ?? "",
+                volume = currentPosition,
+                average_price = (decimal?)null,
+                in_position = currentPosition != 0m,
+                captured_from = "current_position_startup",
+            };
             StrategyLog.Append(
                 $"Started bridge probe build={BuildTag}, session={_sessionId}, source={GetSourceSymbol()}, " +
                 $"server={ServerUrl}, delivery={NormalizedDeliveryMode()}\n");
