@@ -99,6 +99,11 @@ class LiveBridgeController:
     def handle_atas_message(self, payload: Mapping[str, Any]) -> None:
         with self._lock:
             if _is_basis_collector_event(payload):
+                if _is_embedded_basis_event(payload):
+                    # Embedded basis events use the Probe's source sequence;
+                    # recording them as auxiliary events prevents a later
+                    # order/quote event from appearing to have a sequence gap.
+                    self.coordinator.handle(parse_probe_message(payload))
                 self._handle_basis_collector_message(payload)
                 return
             # The demo driver uses the same authenticated WebSocket transport
@@ -248,6 +253,11 @@ def _is_test_driver_event(payload: Mapping[str, Any]) -> bool:
 
 def _is_basis_collector_event(payload: Mapping[str, Any]) -> bool:
     return str(payload.get("event_type", "")) in {"basis_collector_ready", "basis_history"}
+
+
+def _is_embedded_basis_event(payload: Mapping[str, Any]) -> bool:
+    data = payload.get("data")
+    return isinstance(data, Mapping) and bool(data.get("embedded_in_probe", False))
 
 
 def _merge_minute_bars(

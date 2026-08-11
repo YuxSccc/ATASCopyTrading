@@ -2,7 +2,9 @@
 
 `AtasMt5BridgeProbe` is a read-only ATAS Chart Strategy for validating the
 actual event semantics and transport latency of the installed ATAS/MT5 setup.
-It never sends an MT5 trade request and never changes an ATAS order.
+It also actively requests and aggregates the ATAS closed M1 basis window used
+by the live bridge. It never sends an MT5 trade request and never changes an
+ATAS order.
 
 It is read-only. It does not submit, modify, cancel, or copy trading orders.
 
@@ -15,6 +17,7 @@ It is read-only. It does not submit, modify, cancel, or copy trading orders.
 | `OnOrderChanged` | `order_changed` | Price moves, partial fills, state transitions, SL/TP/trailing updates, and cancellations. |
 | `Orders` at startup | `state_snapshot` | Reconnect recovery and callback-scope validation. |
 | `OnBestBidAskChanged` | `quote` | ATAS quote availability, bid/ask semantics, and price freshness. |
+| ATAS cumulative-trade request/cache | `basis_history` | Closed M1 GC history for the GC/XAUUSD basis guard. |
 
 Each order record includes its order/external IDs, direction, type, state,
 price, trigger price, remaining quantity, OCO group, attachment flags,
@@ -24,6 +27,11 @@ The `IsAttached`, `IsInPosition`, OCO, direction, and trigger fields are
 captured as raw observations. The probe intentionally does not label an order
 as SL or TP: that classification must be based on the data observed for your
 connector and your manual workflow.
+
+Production needs only this strategy. The old standalone
+`AtasMt5BasisCollector` source is retained for reference but is not included
+in the deployed DLL; `AtasMt5TestDriver` remains an optional demo-only test
+strategy.
 
 ## Protocol and latency points
 

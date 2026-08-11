@@ -20,7 +20,7 @@ namespace AtasMt5ProbeStrategy
     [DisplayName("AtasMt5BridgeProbe")]
     public sealed class AtasBridgeProbeStrategy : ChartStrategy
     {
-        private const string BuildTag = "2026-08-12-probe-v2";
+        private const string BuildTag = "2026-08-12-probe-v3-embedded-basis";
         private ProbeWebSocketClient? _client;
         private string _sessionId = "";
         private long _eventSequence;
@@ -40,6 +40,12 @@ namespace AtasMt5ProbeStrategy
         // be built from callback-derived state rather than Orders.
         private readonly object _observedOrdersLock = new object();
         private readonly Dictionary<string, ObservedOrder> _observedOrders = new Dictionary<string, ObservedOrder>();
+        private ITradesCache? _basisTrades;
+        private readonly SortedDictionary<DateTime, decimal> _basisMinuteCloses = new SortedDictionary<DateTime, decimal>();
+        private long _lastBasisExportTicks;
+        private bool _basisRequestInFlight;
+        private bool _basisRequestCompleted;
+        private long _basisHistoricalTickCount;
         private bool _disposed;
 
         private sealed class ObservedOrder
@@ -88,6 +94,22 @@ namespace AtasMt5ProbeStrategy
         [DisplayName("Maximum queued quote events")]
         public int MaximumQueuedQuoteEvents { get; set; } = 20;
 
+        [OFT.Attributes.ParameterAttribute]
+        [DisplayName("Capture ATAS M1 basis history")]
+        public bool CaptureBasisHistory { get; set; } = true;
+
+        [OFT.Attributes.ParameterAttribute]
+        [DisplayName("Basis history bars")]
+        public int BasisHistoryBars { get; set; } = 240;
+
+        [OFT.Attributes.ParameterAttribute]
+        [DisplayName("Basis refresh interval seconds")]
+        public int BasisRefreshIntervalSeconds { get; set; } = 60;
+
+        [OFT.Attributes.ParameterAttribute]
+        [DisplayName("ATAS API timestamp UTC offset minutes")]
+        public int AtasApiTimestampUtcOffsetMinutes { get; set; } = 0;
+
         protected override void OnStarted()
         {
             _disposed = false;
@@ -104,6 +126,16 @@ namespace AtasMt5ProbeStrategy
             _droppedQuoteEvents = 0;
             _latestCriticalEventId = 0;
             _client = new ProbeWebSocketClient(ServerUrl);
+            _basisMinuteCloses.Clear();
+            _lastBasisExportTicks = 0;
+            _basisRequestInFlight = false;
+            _basisRequestCompleted = false;
+            _basisHistoricalTickCount = 0;
+            _basisTrades = CaptureBasisHistory
+                ? GetTradesCache(TimeSpan.FromMinutes(Math.Max(1, BasisHistoryBars)))
+                : null;
+            if (CaptureBasisHistory)
+                RequestBasisHistoryWindow();
 
             // ATAS does not guarantee an immediate OnPositionChanged callback
             // when a chart strategy is attached to an already-flat chart.  A
@@ -185,11 +217,123 @@ namespace AtasMt5ProbeStrategy
 
         protected override void OnCalculate(int bar, decimal value)
         {
+            if (_disposed || !CaptureBasisHistory || !CanExportBasisHistory())
+                return;
+
+            MergeCachedBasisTrades();
+            PruneBasisMinuteCloses();
+            EmitBasisHistory();
+            // This is an ATAS-side pull. Refresh the historical window after
+            // the prior request completes instead of waiting for a passive
+            // trade callback or a second strategy.
+            RequestBasisHistoryWindow();
         }
 
         protected override void OnSuspended() => StopProbe();
 
         protected override void OnStopped() => StopProbe();
+
+        protected override void OnCumulativeTradesResponse(
+            CumulativeTradesRequest request,
+            IEnumerable<CumulativeTrade> cumulativeTrades)
+        {
+            _basisRequestInFlight = false;
+            foreach (var cumulativeTrade in cumulativeTrades)
+            {
+                if (cumulativeTrade.Ticks != null && cumulativeTrade.Ticks.Count > 0)
+                {
+                    foreach (var tick in cumulativeTrade.Ticks)
+                    {
+                        AddBasisTrade(tick.Time, tick.Price);
+                        _basisHistoricalTickCount++;
+                    }
+                }
+                else
+                {
+                    AddBasisTrade(cumulativeTrade.Time, cumulativeTrade.Lastprice);
+                }
+            }
+            _basisRequestCompleted = true;
+            PruneBasisMinuteCloses();
+            EmitBasisHistory();
+            StrategyLog.Append(
+                $"Basis history response ticks={_basisHistoricalTickCount}, minutes={_basisMinuteCloses.Count}\n");
+        }
+
+        private bool CanExportBasisHistory()
+        {
+            var now = Stopwatch.GetTimestamp();
+            var intervalTicks = Stopwatch.Frequency * Math.Max(1, BasisRefreshIntervalSeconds);
+            var previous = Interlocked.Read(ref _lastBasisExportTicks);
+            if (previous != 0 && now - previous < intervalTicks)
+                return false;
+            Interlocked.Exchange(ref _lastBasisExportTicks, now);
+            return true;
+        }
+
+        private void RequestBasisHistoryWindow()
+        {
+            if (!CaptureBasisHistory || _basisRequestInFlight)
+                return;
+
+            var endUtcTime = UtcTime;
+            var startUtcTime = endUtcTime.AddMinutes(-Math.Max(1, BasisHistoryBars));
+            _basisRequestInFlight = true;
+            RequestForCumulativeTrades(new CumulativeTradesRequest(startUtcTime, endUtcTime, 0, 0));
+            StrategyLog.Append($"Basis history requested start={startUtcTime:O}, end={endUtcTime:O}\n");
+        }
+
+        private void MergeCachedBasisTrades()
+        {
+            foreach (var trade in _basisTrades?.CachedItems ?? Enumerable.Empty<MarketDataArg>())
+                AddBasisTrade(trade.Time, trade.Price);
+        }
+
+        private void AddBasisTrade(DateTime chartTime, decimal price)
+        {
+            var apiTime = DateTime.SpecifyKind(chartTime, DateTimeKind.Unspecified);
+            var utcTime = apiTime.AddMinutes(-AtasApiTimestampUtcOffsetMinutes);
+            var minute = new DateTime(utcTime.Year, utcTime.Month, utcTime.Day, utcTime.Hour, utcTime.Minute, 0, DateTimeKind.Utc);
+            if (minute < CurrentUtcMinute())
+                _basisMinuteCloses[minute] = price;
+        }
+
+        private void PruneBasisMinuteCloses()
+        {
+            var cutoff = CurrentUtcMinute().AddMinutes(-Math.Max(1, BasisHistoryBars));
+            foreach (var minute in _basisMinuteCloses.Keys.Where(minute => minute < cutoff).ToArray())
+                _basisMinuteCloses.Remove(minute);
+        }
+
+        private void EmitBasisHistory()
+        {
+            var bars = _basisMinuteCloses
+                .TakeLast(Math.Max(1, BasisHistoryBars))
+                .Select(item => new
+                {
+                    time_utc = new DateTimeOffset(item.Key, TimeSpan.Zero).ToString("O"),
+                    close = item.Value,
+                })
+                .Cast<object>()
+                .ToArray();
+            Emit("basis_history", new
+            {
+                embedded_in_probe = true,
+                chart_type = ChartInfo?.ChartType ?? "",
+                time_frame = ChartInfo?.TimeFrame ?? "",
+                collector_mode = "probe_embedded_cumulative_trades",
+                historical_request_completed = _basisRequestCompleted,
+                historical_request_in_flight = _basisRequestInFlight,
+                historical_tick_count = _basisHistoricalTickCount,
+                bars,
+            });
+        }
+
+        private static DateTime CurrentUtcMinute()
+        {
+            var now = DateTime.UtcNow;
+            return new DateTime(now.Year, now.Month, now.Day, now.Hour, now.Minute, 0, DateTimeKind.Utc);
+        }
 
         private async Task SendStartupSnapshotAsync()
         {
@@ -208,6 +352,8 @@ namespace AtasMt5ProbeStrategy
                     capture_quotes = CaptureQuotes,
                     quote_minimum_interval_ms = Math.Max(0, QuoteMinimumIntervalMilliseconds),
                     capture_unchanged_positions = CaptureUnchangedPositions,
+                    capture_basis_history = CaptureBasisHistory,
+                    basis_history_bars = Math.Max(1, BasisHistoryBars),
                 });
 
                 Emit("state_snapshot", new

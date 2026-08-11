@@ -13,6 +13,13 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Basis history is embedded in AtasBridgeProbeStrategy. Keep the old
+         standalone source only as a compatibility reference; it is not
+         exposed as a second production strategy. -->
+    <Compile Remove="AtasMt5BasisCollectorStrategy.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Reference Include="ATAS.DataFeedsCore">
       <HintPath>$(ATAS_HOME)\ATAS.DataFeedsCore.dll</HintPath>
     </Reference>

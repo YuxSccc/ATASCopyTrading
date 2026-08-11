@@ -40,15 +40,15 @@ number, the bridge quarantines the symbol and submits nothing.
      --volume-multiplier 1
    ```
 
-4. Configure the ATAS probe WebSocket as `ws://127.0.0.1:8767`. Add the
-   separate `AtasMt5BasisCollector` strategy to the **same GC trading chart**;
-   it may remain on H1 or any other period. Keep its source symbol as `GC` and
-   keep its `ATAS API timestamp UTC offset minutes` at `0` unless the connector
-   itself returns non-UTC timestamps. This is independent of the chart's
-   display timezone. On startup the collector requests the
-   previous 240 minutes of ATAS historical cumulative trades, aggregates their
-   M1 closes, and then uses the recent trade cache to keep that window moving.
-   It has no trading capability. Confirm that
+4. Configure the `AtasMt5BridgeProbe` WebSocket as `ws://127.0.0.1:8767` and
+   enable its embedded **Capture ATAS M1 basis history** setting. Do not add a
+   separate basis collector for production. The Probe actively requests the
+   previous 240 minutes of ATAS cumulative trades on startup and refreshes that
+   request from the ATAS chart thread; it merges the recent trade cache and
+   publishes the closed M1 window through the same ordered session as orders,
+   positions, and quotes. Keep `ATAS API timestamp UTC offset minutes` at `0`
+   unless the connector itself returns non-UTC timestamps. This is independent
+   of the chart display timezone. Confirm that
    the bridge receives a full ATAS snapshot and the EA posts a complete MT5
    snapshot. The loopback-only `/v1/status` endpoint must show both
    `source_synchronized=true` and `source_position_complete=true` before

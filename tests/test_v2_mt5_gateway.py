@@ -368,3 +368,58 @@ def test_source_history_merge_keeps_prior_closed_minutes_when_collector_restarts
         "2026-08-11T23:00:00+00:00",
     ]
     assert merged[2]["close"] == "4420.4"
+
+
+def test_embedded_basis_event_keeps_probe_sequence_contiguous(tmp_path: Path):
+    controller = LiveBridgeController(
+        source_symbol="GC",
+        target_symbol="XAUUSD",
+        bridge_magic=26081001,
+        database_path=tmp_path / "bridge.db",
+        journal_path=tmp_path / "operations.jsonl",
+    )
+    try:
+        common = {
+            "type": "probe_event",
+            "protocol_version": 1,
+            "session_id": "probe-session",
+            "source_symbol": "GC",
+            "delivery_mode": "async",
+            "atas_timestamp_utc": "2026-08-12T00:00:00Z",
+        }
+        controller.handle_atas_message(
+            {
+                **common,
+                "event_id": 1,
+                "event_type": "basis_history",
+                "data": {
+                    "embedded_in_probe": True,
+                    "bars": [{"time_utc": "2026-08-11T23:59:00Z", "close": "4420.0"}],
+                },
+            }
+        )
+        controller.handle_atas_message(
+            {
+                **common,
+                "event_id": 2,
+                "event_type": "state_snapshot",
+                "data": {
+                    "last_observed_position": {"volume": 0, "average_price": 0},
+                    "position_known": True,
+                    "orders": [],
+                    "orders_complete": False,
+                },
+            }
+        )
+        controller.handle_atas_message(
+            {
+                **common,
+                "event_id": 3,
+                "event_type": "quote",
+                "data": {"best_bid": "4420", "best_ask": "4420.2"},
+            }
+        )
+        assert controller.status()["source_synchronized"] is True
+        assert controller.status()["basis_history"]["source_m1_bars"] == 1  # type: ignore[index]
+    finally:
+        controller.close()
