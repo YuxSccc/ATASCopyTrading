@@ -100,12 +100,16 @@ class LiveBridgeController:
     def status(self) -> dict[str, object]:
         with self._lock:
             operations = tuple(self.coordinator.operation_book.records.values())
+            target_snapshot = self.gateway.snapshot_status()
             return {
                 "execution_enabled": self.execution_enabled,
                 "source_synchronized": self.coordinator.source_book.has_synchronized_snapshot,
                 "source_position_complete": self.coordinator.source_book.snapshot().position_complete
                 if self.coordinator.source_book.has_synchronized_snapshot
                 else False,
+                "target_snapshot_received": target_snapshot["received"],
+                "target_snapshot_fresh": target_snapshot["fresh"],
+                "target_snapshot_age_ms": target_snapshot["age_ms"],
                 "reconciliation_required": self.coordinator.reconciliation_required,
                 "in_flight_operations": sum(record.resolved_at_utc is None for record in operations),
                 "unknown_or_failed_operations": sum(

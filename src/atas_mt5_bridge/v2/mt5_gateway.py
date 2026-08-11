@@ -109,6 +109,19 @@ class Mt5HttpGateway(TargetExecutionPort):
                 return ()
             return tuple(list(self._queued_commands.values())[:limit])
 
+    def snapshot_status(self) -> dict[str, bool | int | None]:
+        """Expose only snapshot liveness for the local operator status page."""
+
+        with self._lock:
+            if self._state is None:
+                return {"received": False, "fresh": False, "age_ms": None}
+            age_seconds = max(0.0, monotonic() - self._state_received_at)
+            return {
+                "received": True,
+                "fresh": age_seconds <= self.snapshot_ttl_seconds,
+                "age_ms": round(age_seconds * 1000),
+            }
+
     def restore_unresolved_command(self, command: BridgeCommand) -> None:
         """Make a pre-restart request acknowledgeable without re-delivering it.
 

@@ -137,6 +137,9 @@ def test_live_controller_caches_mt5_state_before_atas_snapshot_without_planning(
         controller.handle_mt5_snapshot(snapshot())
         status = controller.status()
         assert status["source_synchronized"] is False
+        assert status["target_snapshot_received"] is True
+        assert status["target_snapshot_fresh"] is True
+        assert isinstance(status["target_snapshot_age_ms"], int)
         assert status["in_flight_operations"] == 0
     finally:
         controller.close()
