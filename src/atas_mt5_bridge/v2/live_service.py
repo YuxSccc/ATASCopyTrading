@@ -233,6 +233,10 @@ def start_test_http_server(
 
 def _make_handler(controller: LiveBridgeController, token: str):
     class Mt5Handler(BaseHTTPRequestHandler):
+        # Explicit HTTP/1.1 framing plus Connection: close avoids terminal
+        # builds attempting to reuse a loopback connection after a response.
+        protocol_version = "HTTP/1.1"
+
         def do_GET(self) -> None:  # noqa: N802
             if not self._authorized():
                 self._respond(404, "")
@@ -295,6 +299,7 @@ def _make_handler(controller: LiveBridgeController, token: str):
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(encoded)))
+            self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(encoded)
 

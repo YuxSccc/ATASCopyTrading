@@ -340,6 +340,7 @@ def test_mt5_http_server_offers_commands_over_post_for_mql_compatibility(tmp_pat
         with urlopen(request, timeout=3) as response:
             assert response.status == 200
             assert response.read().decode("utf-8") == command_to_tsv(command())
+            assert response.headers["Connection"] == "close"
     finally:
         server.shutdown()
         server.server_close()
