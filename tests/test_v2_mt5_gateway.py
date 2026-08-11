@@ -260,7 +260,7 @@ def test_controller_rebuilds_basis_only_from_matching_m1_windows(tmp_path: Path)
 
 
 def test_test_driver_events_do_not_reset_the_live_source_session(tmp_path: Path):
-    test_control = DemoTestController(enabled=True, token="test-token", report_path=tmp_path / "test-runs.jsonl")
+    test_control = DemoTestController(enabled=True, report_path=tmp_path / "test-runs.jsonl")
     controller = LiveBridgeController(
         source_symbol="GC",
         target_symbol="XAUUSD",
@@ -301,14 +301,14 @@ def test_mt5_http_server_accepts_the_terminating_nul_sent_by_mql_webrequest(tmp_
         database_path=tmp_path / "bridge.db",
         journal_path=tmp_path / "operations.jsonl",
     )
-    server = start_mt5_http_server(controller, "127.0.0.1", 0, "test-token")
+    server = start_mt5_http_server(controller, "127.0.0.1", 0)
     try:
         payload = json.dumps(snapshot()).encode("utf-8") + b"\x00"
         request = Request(
             f"http://127.0.0.1:{server.server_port}/v1/mt5/snapshot",
             data=payload,
             method="POST",
-            headers={"Content-Type": "application/json", "X-Bridge-Token": "test-token"},
+            headers={"Content-Type": "application/json"},
         )
         with urlopen(request, timeout=3) as response:
             assert response.status == 200
@@ -327,7 +327,7 @@ def test_mt5_http_server_offers_commands_over_post_for_mql_compatibility(tmp_pat
         database_path=tmp_path / "bridge.db",
         journal_path=tmp_path / "operations.jsonl",
     )
-    server = start_mt5_http_server(controller, "127.0.0.1", 0, "test-token")
+    server = start_mt5_http_server(controller, "127.0.0.1", 0)
     try:
         controller.gateway.ingest_snapshot(snapshot())
         controller.gateway.execute(command())
@@ -335,7 +335,7 @@ def test_mt5_http_server_offers_commands_over_post_for_mql_compatibility(tmp_pat
             f"http://127.0.0.1:{server.server_port}/v1/mt5/command",
             data=b"{}\x00",
             method="POST",
-            headers={"Content-Type": "application/json", "X-Bridge-Token": "test-token"},
+            headers={"Content-Type": "application/json"},
         )
         with urlopen(request, timeout=3) as response:
             assert response.status == 200

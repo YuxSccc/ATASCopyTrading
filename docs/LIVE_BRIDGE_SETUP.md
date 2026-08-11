@@ -10,7 +10,7 @@ demo account.
 ```text
 ATAS strategy (localhost WebSocket, :8767)
     -> Python bridge service + SQLite
-    -> localhost HTTP (:8768, token protected)
+    -> localhost HTTP (:8768, loopback-only)
     -> MT5 EA on the XAUUSD chart
     -> MT5 terminal / broker
 ```
@@ -26,8 +26,8 @@ number, the bridge quarantines the symbol and submits nothing.
    exact target symbol chart (normally `XAUUSD`; broker suffixes require the
    same suffix in `--target-symbol`). In the EA settings, add
    `http://127.0.0.1:8768` to MT5's allowed WebRequest URLs.
-2. Use the same non-empty token and Magic number on both sides. Keep
-   `EnableExecution=false` in the EA for the first run.
+2. Set the same Magic number on both sides. Keep `EnableExecution=false` in
+   the EA for the first run.
 3. Start the service without `--enable-execution`; it will record and validate
    ATAS and MT5 state but cannot send a command:
 
@@ -37,8 +37,7 @@ number, the bridge quarantines the symbol and submits nothing.
      --source-symbol GC `
      --target-symbol XAUUSD `
      --bridge-magic 26081001 `
-     --volume-multiplier 1 `
-     --token 'replace-with-a-long-local-token'
+     --volume-multiplier 1
    ```
 
 4. Configure the ATAS probe WebSocket as `ws://127.0.0.1:8767`. Add the
@@ -51,7 +50,7 @@ number, the bridge quarantines the symbol and submits nothing.
    M1 closes, and then uses the recent trade cache to keep that window moving.
    It has no trading capability. Confirm that
    the bridge receives a full ATAS snapshot and the EA posts a complete MT5
-   snapshot. The `/v1/status` endpoint (with the token header) must show both
+   snapshot. The loopback-only `/v1/status` endpoint must show both
    `source_synchronized=true` and `source_position_complete=true` before
    relying on position repair. If ATAS has not yet pushed the existing
    position after strategy start, the bridge deliberately treats it as unknown
@@ -131,13 +130,12 @@ complex “must always be one-directional” MT5 state machine.
 3. If an operation is `UNKNOWN`, first wait for one or more fresh MT5
    snapshots. If its expected effect appears, the service resolves it without
    a duplicate request.
-4. Only after a human verifies **no target-side effect**, a token-protected
-   local operator may release that one command for a new plan:
+4. Only after a human verifies **no target-side effect**, a local operator may
+   release that one command for a new plan:
 
    ```powershell
-   Invoke-RestMethod -Method Post `
+     Invoke-RestMethod -Method Post `
      -Uri 'http://127.0.0.1:8768/v1/operator/confirm-no-effect' `
-     -Headers @{ 'X-Bridge-Token' = 'replace-with-a-long-local-token' } `
      -ContentType 'application/json' `
      -Body '{"command_id":"copy-the-operation-id-from-the-journal"}'
    ```

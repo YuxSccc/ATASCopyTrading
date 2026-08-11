@@ -65,9 +65,8 @@ class DemoTestController:
     scenario = "pending_lifecycle"
     script_scenario = "pending_script"
 
-    def __init__(self, *, enabled: bool, token: str, report_path: Path) -> None:
+    def __init__(self, *, enabled: bool, report_path: Path) -> None:
         self._enabled = enabled
-        self._token = token
         self._report_path = report_path
         self._runs: dict[str, TestRun] = {}
         self._driver_session_id: str | None = None
@@ -274,7 +273,6 @@ class DemoTestController:
             "command_id": f"{run.run_id}:{run.step_index}:{step.action}",
             "run_id": run.run_id,
             "command": step.action,
-            "token": self._token,
             "source_order_id": order_id or "",
             "parameters": parameters,
         }

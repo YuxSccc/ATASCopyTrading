@@ -195,8 +195,8 @@ class LiveBridgeController:
             return command_to_tsv(commands[0]) if commands else ""
 
 
-def start_mt5_http_server(controller: LiveBridgeController, host: str, port: int, token: str) -> ThreadingHTTPServer:
-    handler = _make_handler(controller, token)
+def start_mt5_http_server(controller: LiveBridgeController, host: str, port: int) -> ThreadingHTTPServer:
+    handler = _make_handler(controller)
     server = ThreadingHTTPServer((host, port), handler)
     Thread(target=server.serve_forever, name="mt5-http", daemon=True).start()
     return server
@@ -218,29 +218,25 @@ def start_test_http_server(
     test_controller: DemoTestController,
     host: str,
     port: int,
-    token: str,
 ) -> ThreadingHTTPServer:
     """Start the separate local test-control API.
 
-    Keeping this on its own port/token means the EA's bridge credential cannot
-    be used to create demo orders accidentally.
+    Keeping this on its own loopback-only port means the EA cannot create demo
+    orders accidentally.
     """
-    handler = _make_test_handler(test_controller, token)
+    handler = _make_test_handler(test_controller)
     server = ThreadingHTTPServer((host, port), handler)
     Thread(target=server.serve_forever, name="bridge-test-control", daemon=True).start()
     return server
 
 
-def _make_handler(controller: LiveBridgeController, token: str):
+def _make_handler(controller: LiveBridgeController):
     class Mt5Handler(BaseHTTPRequestHandler):
         # Explicit HTTP/1.1 framing plus Connection: close avoids terminal
         # builds attempting to reuse a loopback connection after a response.
         protocol_version = "HTTP/1.1"
 
         def do_GET(self) -> None:  # noqa: N802
-            if not self._authorized():
-                self._respond(404, "")
-                return
             path = self.path.split("?", 1)[0]
             if path == "/v1/mt5/command":
                 self._respond(200, controller.next_mt5_command(), content_type="text/plain; charset=utf-8")
@@ -250,9 +246,6 @@ def _make_handler(controller: LiveBridgeController, token: str):
                 self._respond(404, "")
 
         def do_POST(self) -> None:  # noqa: N802
-            if not self._authorized():
-                self._respond(403, {"error": "forbidden"})
-                return
             try:
                 body = self._read_json()
                 path = self.path.split("?", 1)[0]
@@ -279,9 +272,6 @@ def _make_handler(controller: LiveBridgeController, token: str):
         def log_message(self, format: str, *args: object) -> None:
             return
 
-        def _authorized(self) -> bool:
-            return bool(token) and self.headers.get("X-Bridge-Token", "") == token
-
         def _read_json(self) -> Mapping[str, Any]:
             content_length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(content_length)
@@ -306,12 +296,9 @@ def _make_handler(controller: LiveBridgeController, token: str):
     return Mt5Handler
 
 
-def _make_test_handler(test_controller: DemoTestController, token: str):
+def _make_test_handler(test_controller: DemoTestController):
     class TestControlHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
-            if not self._authorized():
-                self._respond(404, "")
-                return
             parts = self.path.split("?", 1)[0].strip("/").split("/")
             if len(parts) == 4 and parts[:3] == ["v1", "test", "runs"]:
                 run = test_controller.get_run(parts[3])
@@ -325,9 +312,6 @@ def _make_test_handler(test_controller: DemoTestController, token: str):
                 self._respond(404, {"error": "unknown endpoint"})
 
         def do_POST(self) -> None:  # noqa: N802
-            if not self._authorized():
-                self._respond(403, {"error": "forbidden"})
-                return
             try:
                 body = self._read_json()
                 parts = self.path.split("?", 1)[0].strip("/").split("/")
@@ -350,9 +334,6 @@ def _make_test_handler(test_controller: DemoTestController, token: str):
 
         def log_message(self, format: str, *args: object) -> None:
             return
-
-        def _authorized(self) -> bool:
-            return bool(token) and self.headers.get("X-Test-Control-Token", "") == token
 
         def _read_json(self) -> Mapping[str, Any]:
             content_length = int(self.headers.get("Content-Length", "0"))
@@ -426,7 +407,6 @@ def main() -> int:
     parser.add_argument("--source-symbol", required=True)
     parser.add_argument("--target-symbol", default="XAUUSD")
     parser.add_argument("--bridge-magic", type=int, required=True)
-    parser.add_argument("--token", required=True, help="shared loopback token configured in the MT5 EA")
     parser.add_argument("--state-db", default="bridge-state/bridge.db")
     parser.add_argument("--journal", default="bridge-state/operations.jsonl")
     parser.add_argument("--output-dir", default="probe-data")
@@ -442,18 +422,14 @@ def main() -> int:
     parser.add_argument("--max-basis-dispersion", type=Decimal, default=Decimal("1.00"))
     parser.add_argument("--enable-execution", action="store_true")
     parser.add_argument("--enable-test-control", action="store_true", help="enable the fixed local ATAS demo test scenario")
-    parser.add_argument("--test-token", default="", help="separate token shared only with the ATAS test-control setting")
     parser.add_argument("--test-http-port", type=int, default=8769)
     args = parser.parse_args()
-    if args.enable_test_control and not args.test_token:
-        parser.error("--enable-test-control requires --test-token")
     if args.basis_window_seconds <= 0 or args.basis_half_life_seconds <= 0:
         parser.error("basis window and half-life must be positive")
     if args.basis_minimum_samples <= 0 or args.quote_max_age_ms <= 0 or args.basis_sample_interval_seconds <= 0:
         parser.error("basis sample count, sample interval, and quote maximum age must be positive")
     test_controller = DemoTestController(
         enabled=args.enable_test_control,
-        token=args.test_token,
         report_path=Path(args.output_dir) / "test_runs.jsonl",
     )
     controller = LiveBridgeController(
@@ -475,9 +451,9 @@ def main() -> int:
         ),
         test_controller=test_controller,
     )
-    server = start_mt5_http_server(controller, "127.0.0.1", args.mt5_http_port, args.token)
+    server = start_mt5_http_server(controller, "127.0.0.1", args.mt5_http_port)
     test_server = (
-        start_test_http_server(test_controller, "127.0.0.1", args.test_http_port, args.test_token)
+        start_test_http_server(test_controller, "127.0.0.1", args.test_http_port)
         if args.enable_test_control
         else None
     )

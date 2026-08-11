@@ -3,7 +3,6 @@
 #property description "Local ATAS-to-MT5 bridge observer and guarded command executor."
 
 input string BridgeBaseUrl = "http://127.0.0.1:8768";
-input string BridgeToken = "";
 input long BridgeMagic = 26081001;
 input bool EnableExecution = false;
 input int SnapshotIntervalMilliseconds = 100;
@@ -21,11 +20,6 @@ string g_last_command_reference = "";
 
 int OnInit()
 {
-   if(StringLen(BridgeToken) == 0)
-   {
-      Print("ATAS bridge EA requires a non-empty BridgeToken");
-      return(INIT_PARAMETERS_INCORRECT);
-   }
    LoadCommandState();
    EventSetMillisecondTimer((int)MathMax(10, SnapshotIntervalMilliseconds));
    RefreshM1History(true);
@@ -394,7 +388,7 @@ string CommandStateFileName()
 
 bool Http(string method, string endpoint, string body, string &response, int &status)
 {
-   string headers = "Content-Type: application/json\r\nX-Bridge-Token: " + BridgeToken + "\r\n";
+   string headers = "Content-Type: application/json\r\n";
    char data[];
    char result[];
    string response_headers;

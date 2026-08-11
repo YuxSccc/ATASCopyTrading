@@ -41,10 +41,6 @@ namespace AtasMt5ProbeStrategy
         public bool EnableTestTrading { get; set; } = false;
 
         [OFT.Attributes.ParameterAttribute]
-        [DisplayName("Test-control token")]
-        public string TestControlToken { get; set; } = "";
-
-        [OFT.Attributes.ParameterAttribute]
         [DisplayName("Maximum test quantity")]
         public decimal MaximumTestQuantity { get; set; } = 1m;
 
@@ -79,7 +75,6 @@ namespace AtasMt5ProbeStrategy
             Emit("test_driver_ready", new
             {
                 enabled = EnableTestTrading,
-                has_token = !string.IsNullOrWhiteSpace(TestControlToken),
                 maximum_quantity = MaximumTestQuantity,
                 pending_distance_ticks = PendingDistanceTicks,
                 modify_distance_ticks = ModifyDistanceTicks,
@@ -200,11 +195,6 @@ namespace AtasMt5ProbeStrategy
             if (!EnableTestTrading)
             {
                 EmitReceipt(command, false, "Enable demo test trading is false");
-                return;
-            }
-            if (string.IsNullOrWhiteSpace(TestControlToken) || !string.Equals(TestControlToken, command.Token, StringComparison.Ordinal))
-            {
-                EmitReceipt(command, false, "test-control token rejected");
                 return;
             }
             try

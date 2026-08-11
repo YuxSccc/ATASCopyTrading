@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
@@ -31,7 +30,7 @@ def _receipt(run_id: str, command: str) -> dict:
 
 
 def test_pending_lifecycle_requires_receipts_and_tracks_recreated_order(tmp_path: Path):
-    control = DemoTestController(enabled=True, token="test-token", report_path=tmp_path / "runs.jsonl")
+    control = DemoTestController(enabled=True, report_path=tmp_path / "runs.jsonl")
     created = control.create_run({"scenario": "pending_lifecycle"})
     run_id = str(created["run_id"])
 
@@ -63,7 +62,7 @@ def test_pending_lifecycle_requires_receipts_and_tracks_recreated_order(tmp_path
 
 
 def test_pending_lifecycle_accepts_callbacks_that_arrive_before_command_receipts(tmp_path: Path):
-    control = DemoTestController(enabled=True, token="test-token", report_path=tmp_path / "runs.jsonl")
+    control = DemoTestController(enabled=True, report_path=tmp_path / "runs.jsonl")
     control.observe_probe_event({"event_type": "test_driver_ready", "session_id": "test-driver", "data": {}})
     run_id = str(control.create_run({})["run_id"])
 
@@ -77,13 +76,13 @@ def test_pending_lifecycle_accepts_callbacks_that_arrive_before_command_receipts
 
 
 def test_test_control_rejects_arbitrary_order_options(tmp_path: Path):
-    control = DemoTestController(enabled=True, token="test-token", report_path=tmp_path / "runs.jsonl")
+    control = DemoTestController(enabled=True, report_path=tmp_path / "runs.jsonl")
     with pytest.raises(ValueError, match="unsupported"):
         control.create_run({"quantity": "100"})
 
 
 def test_parameterized_script_is_hot_loaded_without_changing_the_driver(tmp_path: Path):
-    control = DemoTestController(enabled=True, token="test-token", report_path=tmp_path / "runs.jsonl")
+    control = DemoTestController(enabled=True, report_path=tmp_path / "runs.jsonl")
     control.observe_probe_event({"event_type": "test_driver_ready", "session_id": "test-driver", "data": {}})
     created = control.create_run(
         {
@@ -101,16 +100,16 @@ def test_parameterized_script_is_hot_loaded_without_changing_the_driver(tmp_path
     assert command["parameters"]["quantity"] == "0.5"  # type: ignore[index]
 
 
-def test_test_http_server_uses_a_separate_token_and_can_abort(tmp_path: Path):
-    control = DemoTestController(enabled=True, token="test-token", report_path=tmp_path / "runs.jsonl")
-    server = start_test_http_server(control, "127.0.0.1", 0, "control-token")
+def test_loopback_test_http_server_can_abort(tmp_path: Path):
+    control = DemoTestController(enabled=True, report_path=tmp_path / "runs.jsonl")
+    server = start_test_http_server(control, "127.0.0.1", 0)
     base = f"http://127.0.0.1:{server.server_port}"
     try:
         request = Request(
             f"{base}/v1/test/runs",
             data=json.dumps({"scenario": "pending_lifecycle"}).encode(),
             method="POST",
-            headers={"Content-Type": "application/json", "X-Test-Control-Token": "control-token"},
+            headers={"Content-Type": "application/json"},
         )
         with urlopen(request, timeout=3) as response:
             assert response.status == 201
@@ -120,14 +119,12 @@ def test_test_http_server_uses_a_separate_token_and_can_abort(tmp_path: Path):
             f"{base}/v1/test/runs/{run_id}/abort",
             data=b"{}",
             method="POST",
-            headers={"Content-Type": "application/json", "X-Test-Control-Token": "control-token"},
+            headers={"Content-Type": "application/json"},
         )
         with urlopen(abort, timeout=3) as response:
             assert json.loads(response.read())["status"] == "aborted"
-        unauthorized = Request(f"{base}/v1/test/status", headers={"X-Test-Control-Token": "wrong"})
-        with pytest.raises(HTTPError) as error:
-            urlopen(unauthorized, timeout=3)
-        assert error.value.code == 404
+        with urlopen(f"{base}/v1/test/status", timeout=3) as response:
+            assert response.status == 200
     finally:
         server.shutdown()
         server.server_close()

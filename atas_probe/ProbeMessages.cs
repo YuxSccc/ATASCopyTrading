@@ -71,9 +71,6 @@ namespace AtasMt5ProbeStrategy
         [JsonProperty("command")]
         public string Command { get; set; } = "";
 
-        [JsonProperty("token")]
-        public string Token { get; set; } = "";
-
         [JsonProperty("source_order_id")]
         public string SourceOrderId { get; set; } = "";
 
