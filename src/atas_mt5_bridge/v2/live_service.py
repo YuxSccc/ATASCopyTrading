@@ -33,6 +33,7 @@ class LiveBridgeController:
     bridge_magic: int
     database_path: Path
     journal_path: Path
+    basis_recording_directory: Path | None = None
     execution_enabled: bool = False
     volume_multiplier: Decimal = Decimal("1")
     price_guard_config: PriceGuardConfig = field(default_factory=PriceGuardConfig)
@@ -66,6 +67,7 @@ class LiveBridgeController:
             journal=JsonlOperationJournal(path=self.journal_path),
             state_store=self.state_store,
         )
+        self._restore_source_history_from_recordings()
         for record in self.coordinator.operation_book.records.values():
             if record.resolved_at_utc is None:
                 self.gateway.remember_quarantined_command(record.command)
@@ -128,12 +130,43 @@ class LiveBridgeController:
         bars = data.get("bars")
         if not isinstance(bars, list):
             return
-        self._source_m1_history = tuple(
-            {"time_utc": str(item.get("time_utc", "")), "close": str(item.get("close", ""))}
-            for item in bars[-240:]
-            if isinstance(item, Mapping) and item.get("time_utc") not in (None, "") and item.get("close") not in (None, "")
-        )
+        self._source_m1_history = _merge_minute_bars(self._source_m1_history, bars)
         self._refresh_history_calibration()
+
+    def _restore_source_history_from_recordings(self) -> None:
+        """Recover recent source M1 closes from this service's own raw logs.
+
+        The ATAS cumulative-trade API can return only its initial historical
+        segment immediately after an ATAS or service restart. Probe JSONL is
+        already written for diagnosis; recovering its recent closed bars keeps
+        a restart from discarding otherwise valid intraday calibration. Fresh
+        bid/ask and current-basis guards remain mandatory before execution.
+        """
+
+        directory = self.basis_recording_directory
+        if directory is None or not directory.is_dir():
+            return
+        best: tuple[dict[str, object], ...] = ()
+        for path in directory.glob("atas_probe_*.jsonl"):
+            try:
+                with path.open("r", encoding="utf-8") as stream:
+                    for line in stream:
+                        record = json.loads(line)
+                        event = record.get("event")
+                        if not isinstance(event, Mapping):
+                            continue
+                        if event.get("event_type") != "basis_history" or str(event.get("source_symbol", "")).strip() != self.source_symbol:
+                            continue
+                        data = event.get("data")
+                        bars = data.get("bars") if isinstance(data, Mapping) else None
+                        if not isinstance(bars, list):
+                            continue
+                        candidate = _merge_minute_bars((), bars)
+                        if len(candidate) > len(best):
+                            best = candidate
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+        self._source_m1_history = best
 
     def _refresh_history_calibration(self) -> None:
         mapper = self.coordinator.policy.price_mapper
@@ -212,6 +245,24 @@ def _is_test_driver_event(payload: Mapping[str, Any]) -> bool:
 
 def _is_basis_collector_event(payload: Mapping[str, Any]) -> bool:
     return str(payload.get("event_type", "")) in {"basis_collector_ready", "basis_history"}
+
+
+def _merge_minute_bars(
+    existing: tuple[dict[str, object], ...],
+    incoming: list[object],
+) -> tuple[dict[str, object], ...]:
+    """Return the newest 240 valid closed M1 bars keyed by exact UTC text."""
+
+    merged: dict[str, dict[str, object]] = {}
+    for item in (*existing, *incoming):
+        if not isinstance(item, Mapping):
+            continue
+        time_utc = str(item.get("time_utc", "")).strip()
+        close = item.get("close")
+        if not time_utc or close in (None, ""):
+            continue
+        merged[time_utc] = {"time_utc": time_utc, "close": str(close)}
+    return tuple(merged[key] for key in sorted(merged)[-240:])
 
 
 def start_test_http_server(
@@ -438,6 +489,7 @@ def main() -> int:
         bridge_magic=args.bridge_magic,
         database_path=Path(args.state_db),
         journal_path=Path(args.journal),
+        basis_recording_directory=Path(args.output_dir),
         execution_enabled=args.enable_execution,
         volume_multiplier=args.volume_multiplier,
         price_guard_config=PriceGuardConfig(

@@ -9,7 +9,7 @@ from urllib.request import Request, urlopen
 import pytest
 
 from atas_mt5_bridge.v2.models import BridgeCommand, CommandType, OperationStatus
-from atas_mt5_bridge.v2.live_service import LiveBridgeController, start_mt5_http_server
+from atas_mt5_bridge.v2.live_service import LiveBridgeController, _merge_minute_bars, start_mt5_http_server
 from atas_mt5_bridge.v2.test_control import DemoTestController
 from atas_mt5_bridge.v2.mt5_gateway import Mt5GatewayError, Mt5HttpGateway, command_to_tsv
 
@@ -345,3 +345,26 @@ def test_mt5_http_server_offers_commands_over_post_for_mql_compatibility(tmp_pat
         server.shutdown()
         server.server_close()
         controller.close()
+
+
+def test_source_history_merge_keeps_prior_closed_minutes_when_collector_restarts():
+    existing = (
+        {"time_utc": "2026-08-11T22:00:00+00:00", "close": "4420.0"},
+        {"time_utc": "2026-08-11T22:01:00+00:00", "close": "4420.2"},
+    )
+    merged = _merge_minute_bars(
+        existing,
+        [
+            {"time_utc": "2026-08-11T19:00:00+00:00", "close": "4410.0"},
+            {"time_utc": "2026-08-11T22:01:00+00:00", "close": "4420.4"},
+            {"time_utc": "2026-08-11T23:00:00+00:00", "close": "4421.0"},
+        ],
+    )
+
+    assert [bar["time_utc"] for bar in merged] == [
+        "2026-08-11T19:00:00+00:00",
+        "2026-08-11T22:00:00+00:00",
+        "2026-08-11T22:01:00+00:00",
+        "2026-08-11T23:00:00+00:00",
+    ]
+    assert merged[2]["close"] == "4420.4"
