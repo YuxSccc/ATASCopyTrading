@@ -18,6 +18,10 @@ from atas_mt5_bridge.v2.pricing import PriceGuardConfig, PriceMapper, SideBasisE
 NOW = datetime(2026, 8, 10, 9, 0, tzinfo=timezone.utc)
 
 
+def test_default_basis_sample_threshold_allows_scheduled_gc_halt() -> None:
+    assert PriceGuardConfig().minimum_basis_samples == 170
+
+
 def quote(source_bid: str = "3999", source_ask: str = "4000", target_bid: str = "4009", target_ask: str = "4010"):
     source = SourceQuote("GC", Decimal(source_bid), Decimal(source_ask), NOW.isoformat())
     target = TargetQuote("XAUUSD", Decimal(target_bid), Decimal(target_ask), NOW.isoformat())

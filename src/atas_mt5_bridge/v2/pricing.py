@@ -87,10 +87,11 @@ class SideBasisEstimator:
 @dataclass(frozen=True)
 class PriceGuardConfig:
     quote_max_age: timedelta = timedelta(milliseconds=250)
-    # A full three hours of matching closed M1 bars is required by default.
-    # The live bridge is intentionally blocked after startup until the two
-    # terminals have supplied a fresh intraday calibration window.
-    minimum_basis_samples: int = 180
+    # GC has a regular one-hour maintenance halt and may occasionally have a
+    # zero-trade minute in thin periods. 170 matched M1 closes in a four-hour
+    # window preserves nearly three hours of observed calibration without
+    # treating normal session gaps as a pricing fault.
+    minimum_basis_samples: int = 170
     max_current_basis_deviation: Decimal = Decimal("2.00")
     max_basis_dispersion: Decimal = Decimal("1.00")
     basis_window: timedelta = timedelta(hours=4)

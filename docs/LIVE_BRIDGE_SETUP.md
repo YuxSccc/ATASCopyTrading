@@ -55,8 +55,9 @@ number, the bridge quarantines the symbol and submits nothing.
    `source_synchronized=true` and `source_position_complete=true` before
    relying on position repair. If ATAS has not yet pushed the existing
    position after strategy start, the bridge deliberately treats it as unknown
-   rather than as flat. Before execution, `/v1/status` must also show at least
-   180 source and target M1 bars and at least 180 basis samples. Raw bars and
+   rather than as flat. Before execution, `/v1/status` must also show a current
+   source and target M1 history and at least 170 matching basis samples. This
+   allows GC's scheduled one-hour halt and occasional zero-trade minutes. Raw bars and
    a previous process's basis are not kept in SQLite: the calibration is
    rebuilt from the recent intraday windows after every bridge start.
 5. For a demo test only, start the service with `--enable-execution` **and**
@@ -155,7 +156,7 @@ complex “must always be one-directional” MT5 state machine.
   disconnect only quote events are capped (20 by default); order/position
   events and periodic authoritative snapshots remain queued. MT5 and ATAS
   callbacks are serialized by symbol inside the service.
-- Quotes must be fresh (250 ms), basis history must have 180 matching closed
+- Quotes must be fresh (250 ms), basis history must have 170 matching closed
   M1 samples, and the
   current side basis cannot deviate more than 2.00 or have dispersion above
   1.00. ATAS freshness uses its callback timestamp; MT5 freshness uses the

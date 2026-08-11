@@ -419,7 +419,7 @@ def main() -> int:
     parser.add_argument("--basis-window-seconds", type=int, default=4 * 60 * 60)
     parser.add_argument("--basis-half-life-seconds", type=int, default=15 * 60)
     parser.add_argument("--basis-sample-interval-seconds", type=int, default=60)
-    parser.add_argument("--basis-minimum-samples", type=int, default=180)
+    parser.add_argument("--basis-minimum-samples", type=int, default=170)
     parser.add_argument("--quote-max-age-ms", type=int, default=250)
     parser.add_argument("--max-current-basis-deviation", type=Decimal, default=Decimal("2.00"))
     parser.add_argument("--max-basis-dispersion", type=Decimal, default=Decimal("1.00"))
