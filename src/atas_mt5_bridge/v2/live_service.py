@@ -178,7 +178,10 @@ def _make_handler(controller: LiveBridgeController, token: str):
         def _read_json(self) -> Mapping[str, Any]:
             content_length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(content_length)
-            value = json.loads(raw.decode("utf-8"))
+            # MQL5 WebRequest sends the terminating NUL added by
+            # StringToCharArray and includes it in Content-Length. Accept that
+            # transport detail while still requiring one valid JSON object.
+            value = json.loads(raw.decode("utf-8").rstrip("\x00"))
             if not isinstance(value, Mapping):
                 raise ValueError("JSON body must be an object")
             return value

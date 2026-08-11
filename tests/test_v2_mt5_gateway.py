@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 from pathlib import Path
+from urllib.request import Request, urlopen
 
 import pytest
 
 from atas_mt5_bridge.v2.models import BridgeCommand, CommandType, OperationStatus
-from atas_mt5_bridge.v2.live_service import LiveBridgeController
+from atas_mt5_bridge.v2.live_service import LiveBridgeController, start_mt5_http_server
 from atas_mt5_bridge.v2.mt5_gateway import Mt5GatewayError, Mt5HttpGateway, command_to_tsv
 
 
@@ -142,4 +144,30 @@ def test_live_controller_caches_mt5_state_before_atas_snapshot_without_planning(
         assert isinstance(status["target_snapshot_age_ms"], int)
         assert status["in_flight_operations"] == 0
     finally:
+        controller.close()
+
+
+def test_mt5_http_server_accepts_the_terminating_nul_sent_by_mql_webrequest(tmp_path: Path):
+    controller = LiveBridgeController(
+        source_symbol="GC",
+        target_symbol="XAUUSD",
+        bridge_magic=26081001,
+        database_path=tmp_path / "bridge.db",
+        journal_path=tmp_path / "operations.jsonl",
+    )
+    server = start_mt5_http_server(controller, "127.0.0.1", 0, "test-token")
+    try:
+        payload = json.dumps(snapshot()).encode("utf-8") + b"\x00"
+        request = Request(
+            f"http://127.0.0.1:{server.server_port}/v1/mt5/snapshot",
+            data=payload,
+            method="POST",
+            headers={"Content-Type": "application/json", "X-Bridge-Token": "test-token"},
+        )
+        with urlopen(request, timeout=3) as response:
+            assert response.status == 200
+        assert controller.status()["target_snapshot_received"] is True
+    finally:
+        server.shutdown()
+        server.server_close()
         controller.close()

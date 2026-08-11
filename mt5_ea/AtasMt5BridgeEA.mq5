@@ -357,15 +357,11 @@ bool Http(string method, string endpoint, string body, string &response, int &st
    char data[];
    char result[];
    string response_headers;
-   // StringToCharArray includes a trailing NUL by default. WebRequest sends
-   // the entire array, while JSON permits no trailing NUL byte. MT5's GET
-   // implementation expects an allocated data array, so preserve one byte
-   // for an empty body; the local server doesn't read GET request bodies.
-   int encoded_count = StringToCharArray(body, data, 0, WHOLE_ARRAY, CP_UTF8);
-   if(StringLen(body) == 0)
-      ArrayResize(data, 1);
-   else
-      ArrayResize(data, encoded_count > 0 ? encoded_count - 1 : 0);
+   // The MQL5 WebRequest implementation is most reliable when it receives
+   // the native StringToCharArray buffer, including its terminating NUL.
+   // The loopback service strips that one transport terminator before JSON
+   // parsing, rather than resizing MQL's request buffer on the EA side.
+   StringToCharArray(body, data, 0, WHOLE_ARRAY, CP_UTF8);
    ResetLastError();
    status = WebRequest(method, BridgeBaseUrl + endpoint, headers, HttpTimeoutMilliseconds, data, result, response_headers);
    if(status == -1)
