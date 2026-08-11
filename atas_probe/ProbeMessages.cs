@@ -54,5 +54,26 @@ namespace AtasMt5ProbeStrategy
 
         [JsonProperty("server_received_monotonic_ns")]
         public long ServerReceivedMonotonicNs { get; set; }
+
+        [JsonProperty("test_command")]
+        public ProbeTestCommand? TestCommand { get; set; }
+    }
+
+    internal sealed class ProbeTestCommand
+    {
+        [JsonProperty("command_id")]
+        public string CommandId { get; set; } = "";
+
+        [JsonProperty("run_id")]
+        public string RunId { get; set; } = "";
+
+        [JsonProperty("command")]
+        public string Command { get; set; } = "";
+
+        [JsonProperty("token")]
+        public string Token { get; set; } = "";
+
+        [JsonProperty("source_order_id")]
+        public string SourceOrderId { get; set; } = "";
     }
 }

@@ -9,6 +9,7 @@ import pytest
 
 from atas_mt5_bridge.v2.models import BridgeCommand, CommandType, OperationStatus
 from atas_mt5_bridge.v2.live_service import LiveBridgeController, start_mt5_http_server
+from atas_mt5_bridge.v2.test_control import DemoTestController
 from atas_mt5_bridge.v2.mt5_gateway import Mt5GatewayError, Mt5HttpGateway, command_to_tsv
 
 
@@ -143,6 +144,32 @@ def test_live_controller_caches_mt5_state_before_atas_snapshot_without_planning(
         assert status["target_snapshot_fresh"] is True
         assert isinstance(status["target_snapshot_age_ms"], int)
         assert status["in_flight_operations"] == 0
+    finally:
+        controller.close()
+
+
+def test_test_driver_events_do_not_reset_the_live_source_session(tmp_path: Path):
+    test_control = DemoTestController(enabled=True, token="test-token", report_path=tmp_path / "test-runs.jsonl")
+    controller = LiveBridgeController(
+        source_symbol="GC",
+        target_symbol="XAUUSD",
+        bridge_magic=26081001,
+        database_path=tmp_path / "bridge.db",
+        journal_path=tmp_path / "operations.jsonl",
+        test_controller=test_control,
+    )
+    try:
+        controller.handle_atas_message(
+            {
+                "session_id": "test-driver-session",
+                "event_type": "test_driver_ready",
+                "data": {},
+            }
+        )
+        assert controller.status()["source_synchronized"] is False
+        created = test_control.create_run({})
+        assert test_control.command_for_ack("test-driver-session") is not None
+        assert created["scenario"] == "pending_lifecycle"
     finally:
         controller.close()
 

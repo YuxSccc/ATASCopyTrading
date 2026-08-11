@@ -20,6 +20,7 @@ from .models import ExecutionReceipt, OperationStatus
 from .persistence import SqliteBridgeStateStore
 from .policy import AtasAuthoritativePolicy
 from .pricing import PriceMapper
+from .test_control import DemoTestController
 
 
 @dataclass
@@ -33,6 +34,7 @@ class LiveBridgeController:
     journal_path: Path
     execution_enabled: bool = False
     volume_multiplier: Decimal = Decimal("1")
+    test_controller: DemoTestController | None = None
     gateway: Mt5HttpGateway = field(init=False)
     state_store: SqliteBridgeStateStore = field(init=False)
     coordinator: SymbolCoordinator = field(init=False)
@@ -76,8 +78,17 @@ class LiveBridgeController:
 
     def handle_atas_message(self, payload: Mapping[str, Any]) -> None:
         with self._lock:
+            # The demo driver uses the same authenticated WebSocket transport
+            # as the observation probe, but it is not a second source of
+            # trade intent.  Feeding its separate session into SourceStateBook
+            # would reset the live ATAS session on every test callback.
+            if self.test_controller is not None and _is_test_driver_event(payload):
+                self.test_controller.observe_probe_event(payload)
+                return
             event = parse_probe_message(payload)
             self.coordinator.handle(event)
+            if self.test_controller is not None:
+                self.test_controller.observe_probe_event(payload)
 
     def handle_mt5_snapshot(self, payload: Mapping[str, Any]) -> None:
         with self._lock:
@@ -116,6 +127,7 @@ class LiveBridgeController:
                     record.resolved_at_utc is None and record.status in {OperationStatus.UNKNOWN, OperationStatus.FAILED}
                     for record in operations
                 ),
+                "test_control_enabled": bool(self.test_controller and self.test_controller.enabled),
             }
 
     def next_mt5_command(self) -> str:
@@ -128,6 +140,31 @@ def start_mt5_http_server(controller: LiveBridgeController, host: str, port: int
     handler = _make_handler(controller, token)
     server = ThreadingHTTPServer((host, port), handler)
     Thread(target=server.serve_forever, name="mt5-http", daemon=True).start()
+    return server
+
+
+def _is_test_driver_event(payload: Mapping[str, Any]) -> bool:
+    event_type = str(payload.get("event_type", ""))
+    if event_type in {"test_driver_ready", "test_command_receipt", "test_driver_error"}:
+        return True
+    data = payload.get("data")
+    return isinstance(data, Mapping) and str(data.get("comment", "")).startswith("AB2TEST:")
+
+
+def start_test_http_server(
+    test_controller: DemoTestController,
+    host: str,
+    port: int,
+    token: str,
+) -> ThreadingHTTPServer:
+    """Start the separate local test-control API.
+
+    Keeping this on its own port/token means the EA's bridge credential cannot
+    be used to create demo orders accidentally.
+    """
+    handler = _make_test_handler(test_controller, token)
+    server = ThreadingHTTPServer((host, port), handler)
+    Thread(target=server.serve_forever, name="bridge-test-control", daemon=True).start()
     return server
 
 
@@ -198,6 +235,73 @@ def _make_handler(controller: LiveBridgeController, token: str):
     return Mt5Handler
 
 
+def _make_test_handler(test_controller: DemoTestController, token: str):
+    class TestControlHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            if not self._authorized():
+                self._respond(404, "")
+                return
+            parts = self.path.split("?", 1)[0].strip("/").split("/")
+            if len(parts) == 4 and parts[:3] == ["v1", "test", "runs"]:
+                run = test_controller.get_run(parts[3])
+                if run is None:
+                    self._respond(404, {"error": "test run not found"})
+                else:
+                    self._respond(200, run)
+            elif parts == ["v1", "test", "status"]:
+                self._respond(200, {"enabled": test_controller.enabled, "scenario": test_controller.scenario})
+            else:
+                self._respond(404, {"error": "unknown endpoint"})
+
+        def do_POST(self) -> None:  # noqa: N802
+            if not self._authorized():
+                self._respond(403, {"error": "forbidden"})
+                return
+            try:
+                body = self._read_json()
+                parts = self.path.split("?", 1)[0].strip("/").split("/")
+                if parts == ["v1", "test", "runs"]:
+                    response = test_controller.create_run(body)
+                    self._respond(201, response)
+                    return
+                if len(parts) == 5 and parts[:3] == ["v1", "test", "runs"] and parts[4] == "abort":
+                    response = test_controller.abort_run(parts[3])
+                    if response is None:
+                        self._respond(404, {"error": "test run not found"})
+                    else:
+                        self._respond(200, response)
+                    return
+                self._respond(404, {"error": "unknown endpoint"})
+            except PermissionError as error:
+                self._respond(403, {"error": str(error)})
+            except (ValueError, json.JSONDecodeError) as error:
+                self._respond(400, {"error": str(error)})
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+        def _authorized(self) -> bool:
+            return bool(token) and self.headers.get("X-Test-Control-Token", "") == token
+
+        def _read_json(self) -> Mapping[str, Any]:
+            content_length = int(self.headers.get("Content-Length", "0"))
+            value = json.loads(self.rfile.read(content_length).decode("utf-8"))
+            if not isinstance(value, Mapping):
+                raise ValueError("JSON body must be an object")
+            return value
+
+        def _respond(self, status: int, body: object, content_type: str = "application/json; charset=utf-8") -> None:
+            payload = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)
+            encoded = payload.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+    return TestControlHandler
+
+
 async def serve(
     controller: LiveBridgeController,
     *,
@@ -220,6 +324,10 @@ async def serve(
                     event = parse_probe_event(payload)
                     acknowledgement = recorder.record(event)
                     controller.handle_atas_message(payload)
+                    if controller.test_controller is not None:
+                        test_command = controller.test_controller.command_for_ack(event.session_id)
+                        if test_command is not None:
+                            acknowledgement["test_command"] = test_command
                     await websocket.send(json.dumps(acknowledgement, ensure_ascii=False))
                 except (json.JSONDecodeError, ProbeProtocolError, ValueError) as error:
                     await websocket.send(json.dumps({"type": "probe_error", "message": str(error)}))
@@ -255,7 +363,17 @@ def main() -> int:
     parser.add_argument("--mt5-http-port", type=int, default=8768)
     parser.add_argument("--volume-multiplier", type=Decimal, default=Decimal("1"))
     parser.add_argument("--enable-execution", action="store_true")
+    parser.add_argument("--enable-test-control", action="store_true", help="enable the fixed local ATAS demo test scenario")
+    parser.add_argument("--test-token", default="", help="separate token shared only with the ATAS test-control setting")
+    parser.add_argument("--test-http-port", type=int, default=8769)
     args = parser.parse_args()
+    if args.enable_test_control and not args.test_token:
+        parser.error("--enable-test-control requires --test-token")
+    test_controller = DemoTestController(
+        enabled=args.enable_test_control,
+        token=args.test_token,
+        report_path=Path(args.output_dir) / "test_runs.jsonl",
+    )
     controller = LiveBridgeController(
         source_symbol=args.source_symbol,
         target_symbol=args.target_symbol,
@@ -264,8 +382,14 @@ def main() -> int:
         journal_path=Path(args.journal),
         execution_enabled=args.enable_execution,
         volume_multiplier=args.volume_multiplier,
+        test_controller=test_controller,
     )
     server = start_mt5_http_server(controller, "127.0.0.1", args.mt5_http_port, args.token)
+    test_server = (
+        start_test_http_server(test_controller, "127.0.0.1", args.test_http_port, args.test_token)
+        if args.enable_test_control
+        else None
+    )
     try:
         asyncio.run(
             serve(
@@ -277,6 +401,11 @@ def main() -> int:
         )
     finally:
         server.shutdown()
+        if test_server is not None:
+            test_server.shutdown()
+        server.server_close()
+        if test_server is not None:
+            test_server.server_close()
         controller.close()
     return 0
 
