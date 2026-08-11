@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import dataclass, field
+from datetime import timedelta
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -19,7 +20,7 @@ from .mt5_gateway import Mt5HttpGateway, command_to_tsv
 from .models import ExecutionReceipt, OperationStatus
 from .persistence import SqliteBridgeStateStore
 from .policy import AtasAuthoritativePolicy
-from .pricing import PriceMapper
+from .pricing import PriceGuardConfig, PriceMapper
 from .test_control import DemoTestController
 
 
@@ -34,16 +35,24 @@ class LiveBridgeController:
     journal_path: Path
     execution_enabled: bool = False
     volume_multiplier: Decimal = Decimal("1")
+    price_guard_config: PriceGuardConfig = field(default_factory=PriceGuardConfig)
     test_controller: DemoTestController | None = None
     gateway: Mt5HttpGateway = field(init=False)
     state_store: SqliteBridgeStateStore = field(init=False)
     coordinator: SymbolCoordinator = field(init=False)
+    _source_m1_history: tuple[dict[str, object], ...] = field(default=(), init=False, repr=False)
     _lock: RLock = field(default_factory=RLock, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.state_store = SqliteBridgeStateStore(self.database_path)
         self.gateway = Mt5HttpGateway(self.target_symbol, self.bridge_magic)
-        mapper = PriceMapper.from_data(self.state_store.load_market_state(self.target_symbol)) if self.execution_enabled else None
+        # Calibration must run in observation mode too. Otherwise the first
+        # live order has neither a measured GC/XAUUSD basis nor evidence that
+        # the chosen guard thresholds match the broker's feed.
+        # Do not restore any prior basis from SQLite.  Every process starts
+        # uncalibrated and must receive matching recent closed M1 windows from
+        # ATAS and MT5 before it is allowed to map a pending price.
+        mapper = PriceMapper.from_data(None, config=self.price_guard_config)
         self.coordinator = SymbolCoordinator(
             source_symbol=self.source_symbol,
             target_symbol=self.target_symbol,
@@ -78,6 +87,9 @@ class LiveBridgeController:
 
     def handle_atas_message(self, payload: Mapping[str, Any]) -> None:
         with self._lock:
+            if _is_basis_collector_event(payload):
+                self._handle_basis_collector_message(payload)
+                return
             # The demo driver uses the same authenticated WebSocket transport
             # as the observation probe, but it is not a second source of
             # trade intent.  Feeding its separate session into SourceStateBook
@@ -93,7 +105,32 @@ class LiveBridgeController:
     def handle_mt5_snapshot(self, payload: Mapping[str, Any]) -> None:
         with self._lock:
             self.gateway.ingest_snapshot(payload)
+            self._refresh_history_calibration()
             self.coordinator.handle_target_observation()
+
+    def _handle_basis_collector_message(self, payload: Mapping[str, Any]) -> None:
+        if str(payload.get("event_type", "")) != "basis_history":
+            return
+        if str(payload.get("source_symbol", "")).strip() != self.source_symbol:
+            return
+        data = payload.get("data")
+        if not isinstance(data, Mapping):
+            return
+        bars = data.get("bars")
+        if not isinstance(bars, list):
+            return
+        self._source_m1_history = tuple(
+            {"time_utc": str(item.get("time_utc", "")), "close": str(item.get("close", ""))}
+            for item in bars[-240:]
+            if isinstance(item, Mapping) and item.get("time_utc") not in (None, "") and item.get("close") not in (None, "")
+        )
+        self._refresh_history_calibration()
+
+    def _refresh_history_calibration(self) -> None:
+        mapper = self.coordinator.policy.price_mapper
+        target_bars = self.gateway.latest_m1_history()
+        if mapper is not None and self._source_m1_history and target_bars:
+            mapper.calibrate_from_minute_history(self._source_m1_history, target_bars)
 
     def handle_mt5_receipt(self, payload: Mapping[str, Any]) -> None:
         with self._lock:
@@ -112,6 +149,9 @@ class LiveBridgeController:
         with self._lock:
             operations = tuple(self.coordinator.operation_book.records.values())
             target_snapshot = self.gateway.snapshot_status()
+            source_state = self.coordinator.source_book.snapshot() if self.coordinator.source_book.has_synchronized_snapshot else None
+            target_state = self.gateway.latest_state()
+            mapper = self.coordinator.policy.price_mapper
             return {
                 "execution_enabled": self.execution_enabled,
                 "source_synchronized": self.coordinator.source_book.has_synchronized_snapshot,
@@ -128,6 +168,16 @@ class LiveBridgeController:
                     for record in operations
                 ),
                 "test_control_enabled": bool(self.test_controller and self.test_controller.enabled),
+                "basis": mapper.diagnostics(
+                    source_state.quote if source_state is not None else None,
+                    target_state.quote if target_state is not None else None,
+                )
+                if mapper is not None
+                else None,
+                "basis_history": {
+                    "source_m1_bars": len(self._source_m1_history),
+                    "target_m1_bars": len(self.gateway.latest_m1_history()),
+                },
             }
 
     def next_mt5_command(self) -> str:
@@ -145,10 +195,14 @@ def start_mt5_http_server(controller: LiveBridgeController, host: str, port: int
 
 def _is_test_driver_event(payload: Mapping[str, Any]) -> bool:
     event_type = str(payload.get("event_type", ""))
-    if event_type in {"test_driver_ready", "test_command_receipt", "test_driver_error"}:
+    if event_type in {"test_driver_ready", "test_driver_heartbeat", "test_command_receipt", "test_driver_error"}:
         return True
     data = payload.get("data")
     return isinstance(data, Mapping) and str(data.get("comment", "")).startswith("AB2TEST:")
+
+
+def _is_basis_collector_event(payload: Mapping[str, Any]) -> bool:
+    return str(payload.get("event_type", "")) in {"basis_collector_ready", "basis_history"}
 
 
 def start_test_http_server(
@@ -249,7 +303,7 @@ def _make_test_handler(test_controller: DemoTestController, token: str):
                 else:
                     self._respond(200, run)
             elif parts == ["v1", "test", "status"]:
-                self._respond(200, {"enabled": test_controller.enabled, "scenario": test_controller.scenario})
+                self._respond(200, test_controller.status())
             else:
                 self._respond(404, {"error": "unknown endpoint"})
 
@@ -362,6 +416,13 @@ def main() -> int:
     parser.add_argument("--websocket-port", type=int, default=8767)
     parser.add_argument("--mt5-http-port", type=int, default=8768)
     parser.add_argument("--volume-multiplier", type=Decimal, default=Decimal("1"))
+    parser.add_argument("--basis-window-seconds", type=int, default=4 * 60 * 60)
+    parser.add_argument("--basis-half-life-seconds", type=int, default=15 * 60)
+    parser.add_argument("--basis-sample-interval-seconds", type=int, default=60)
+    parser.add_argument("--basis-minimum-samples", type=int, default=180)
+    parser.add_argument("--quote-max-age-ms", type=int, default=250)
+    parser.add_argument("--max-current-basis-deviation", type=Decimal, default=Decimal("2.00"))
+    parser.add_argument("--max-basis-dispersion", type=Decimal, default=Decimal("1.00"))
     parser.add_argument("--enable-execution", action="store_true")
     parser.add_argument("--enable-test-control", action="store_true", help="enable the fixed local ATAS demo test scenario")
     parser.add_argument("--test-token", default="", help="separate token shared only with the ATAS test-control setting")
@@ -369,6 +430,10 @@ def main() -> int:
     args = parser.parse_args()
     if args.enable_test_control and not args.test_token:
         parser.error("--enable-test-control requires --test-token")
+    if args.basis_window_seconds <= 0 or args.basis_half_life_seconds <= 0:
+        parser.error("basis window and half-life must be positive")
+    if args.basis_minimum_samples <= 0 or args.quote_max_age_ms <= 0 or args.basis_sample_interval_seconds <= 0:
+        parser.error("basis sample count, sample interval, and quote maximum age must be positive")
     test_controller = DemoTestController(
         enabled=args.enable_test_control,
         token=args.test_token,
@@ -382,6 +447,15 @@ def main() -> int:
         journal_path=Path(args.journal),
         execution_enabled=args.enable_execution,
         volume_multiplier=args.volume_multiplier,
+        price_guard_config=PriceGuardConfig(
+            basis_window=timedelta(seconds=args.basis_window_seconds),
+            basis_half_life=timedelta(seconds=args.basis_half_life_seconds),
+            minimum_basis_samples=args.basis_minimum_samples,
+            minimum_sample_interval=timedelta(seconds=args.basis_sample_interval_seconds),
+            quote_max_age=timedelta(milliseconds=args.quote_max_age_ms),
+            max_current_basis_deviation=args.max_current_basis_deviation,
+            max_basis_dispersion=args.max_basis_dispersion,
+        ),
         test_controller=test_controller,
     )
     server = start_mt5_http_server(controller, "127.0.0.1", args.mt5_http_port, args.token)

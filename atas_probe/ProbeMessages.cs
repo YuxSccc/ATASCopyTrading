@@ -1,4 +1,5 @@
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 
 namespace AtasMt5ProbeStrategy
 {
@@ -75,5 +76,8 @@ namespace AtasMt5ProbeStrategy
 
         [JsonProperty("source_order_id")]
         public string SourceOrderId { get; set; } = "";
+
+        [JsonProperty("parameters")]
+        public JObject Parameters { get; set; } = new JObject();
     }
 }

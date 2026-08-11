@@ -133,7 +133,7 @@ def test_stale_quote_blocks_mapping():
     assert decision.reason == "price_guard_stale_quote"
 
 
-def test_basis_history_round_trips_for_database_restart_recovery():
+def test_basis_history_is_not_restored_after_database_restart():
     mapper = PriceMapper(config=PriceGuardConfig(minimum_basis_samples=1))
     now = datetime.now(timezone.utc)
     source = SourceQuote("GC", Decimal("3999"), Decimal("4000"), now.isoformat())
@@ -142,8 +142,25 @@ def test_basis_history_round_trips_for_database_restart_recovery():
 
     restored = PriceMapper.from_data(mapper.to_data(), config=mapper.config)
 
-    assert restored.estimator.estimate("buy", now) == Decimal("10")
-    assert restored.estimator.estimate("sell", now) == Decimal("10")
+    assert restored.estimator.samples == []
+
+
+def test_minute_history_calibration_aligns_utc_minutes_and_retains_only_basis_samples():
+    mapper = PriceMapper(config=PriceGuardConfig(minimum_basis_samples=2))
+    count = mapper.calibrate_from_minute_history(
+        [
+            {"time_utc": "2026-08-10T09:00:45+00:00", "close": "4000"},
+            {"time_utc": "2026-08-10T09:01:00+00:00", "close": "4001"},
+        ],
+        [
+            {"time_utc": "2026-08-10T09:00:00+00:00", "close": "4010"},
+            {"time_utc": "2026-08-10T09:01:58+00:00", "close": "4012"},
+            {"time_utc": "2026-08-10T09:03:00+00:00", "close": "9999"},
+        ],
+    )
+
+    assert count == 2
+    assert mapper.estimator.estimate("buy", NOW) == Decimal("10")
 
 
 def test_price_guard_validates_the_volume_after_the_configured_mapping_multiplier():

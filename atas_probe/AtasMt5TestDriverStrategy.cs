@@ -29,6 +29,7 @@ namespace AtasMt5ProbeStrategy
         private readonly object _outboxLock = new object();
         private Task _outboxTail = Task.CompletedTask;
         private readonly HashSet<string> _executedCommandIds = new HashSet<string>(StringComparer.Ordinal);
+        private Timer? _heartbeatTimer;
         private bool _disposed;
 
         [OFT.Attributes.ParameterAttribute]
@@ -66,6 +67,14 @@ namespace AtasMt5ProbeStrategy
             _eventSequence = 0;
             _executedCommandIds.Clear();
             _client = new ProbeWebSocketClient(ServerUrl);
+            // Commands are returned in acknowledgement messages. A small
+            // heartbeat lets a newly queued test be picked up even when the
+            // driver connected before the operator created that test.
+            _heartbeatTimer = new Timer(
+                _ => Emit("test_driver_heartbeat", new { }),
+                null,
+                TimeSpan.FromSeconds(1),
+                TimeSpan.FromSeconds(1));
             StrategyLog.Append($"Test driver started session={_sessionId}, enabled={EnableTestTrading}, server={ServerUrl}\n");
             Emit("test_driver_ready", new
             {
@@ -134,6 +143,8 @@ namespace AtasMt5ProbeStrategy
 
         private void Emit(string eventType, object data)
         {
+            if (_disposed)
+                return;
             var message = new ProbeEnvelope
             {
                 SessionId = _sessionId,
@@ -224,17 +235,24 @@ namespace AtasMt5ProbeStrategy
         private async Task OpenPendingAsync(ProbeTestCommand command)
         {
             ValidateTradingContext(command);
-            if (BestBid == null)
-                throw new InvalidOperationException("best bid is unavailable");
-            var distance = Math.Max(1, PendingDistanceTicks) * ValidatedPriceStep();
+            if (BestBid == null || BestAsk == null)
+                throw new InvalidOperationException("best bid/ask is unavailable");
+            var direction = RequestedDirection(command);
+            var offsetTicks = RequestedOffsetTicks(command, "price_offset_ticks", -Math.Max(1, PendingDistanceTicks));
+            var reference = direction == OrderDirections.Buy ? BestAsk.Price : BestBid.Price;
+            var price = reference + offsetTicks * ValidatedPriceStep();
+            if (direction == OrderDirections.Buy && price >= BestAsk.Price)
+                throw new InvalidOperationException("buy limit test price must remain below the ask");
+            if (direction == OrderDirections.Sell && price <= BestBid.Price)
+                throw new InvalidOperationException("sell limit test price must remain above the bid");
             var order = new Order
             {
                 Portfolio = Portfolio,
                 Security = Security,
-                Direction = OrderDirections.Buy,
+                Direction = direction,
                 Type = OrderTypes.Limit,
-                Price = BestBid.Price - distance,
-                QuantityToFill = ValidatedQuantity(),
+                Price = price,
+                QuantityToFill = RequestedQuantity(command),
                 Comment = Marker(command.RunId),
             };
             await OpenOrderAsync(order);
@@ -243,14 +261,25 @@ namespace AtasMt5ProbeStrategy
         private async Task ModifyPendingAsync(ProbeTestCommand command)
         {
             var order = FindOwnedOrder(command);
-            var distance = Math.Max(1, ModifyDistanceTicks) * ValidatedPriceStep();
+            if (BestBid == null || BestAsk == null)
+                throw new InvalidOperationException("best bid/ask is unavailable");
+            if (order.Type != OrderTypes.Limit)
+                throw new InvalidOperationException("only test limit orders may be modified");
+            var fallback = order.Direction == OrderDirections.Buy ? -Math.Max(1, ModifyDistanceTicks) : Math.Max(1, ModifyDistanceTicks);
+            var offsetTicks = RequestedOffsetTicks(command, "price_offset_ticks", fallback);
+            var reference = order.Direction == OrderDirections.Buy ? BestAsk.Price : BestBid.Price;
+            var price = reference + offsetTicks * ValidatedPriceStep();
+            if (order.Direction == OrderDirections.Buy && price >= BestAsk.Price)
+                throw new InvalidOperationException("buy limit test price must remain below the ask");
+            if (order.Direction == OrderDirections.Sell && price <= BestBid.Price)
+                throw new InvalidOperationException("sell limit test price must remain above the bid");
             var newOrder = new Order
             {
                 Portfolio = order.Portfolio,
                 Security = order.Security,
                 Direction = order.Direction,
                 Type = order.Type,
-                Price = order.Price - distance,
+                Price = price,
                 TriggerPrice = order.TriggerPrice,
                 TriggerPriceType = order.TriggerPriceType,
                 QuantityToFill = order.QuantityToFill,
@@ -290,6 +319,33 @@ namespace AtasMt5ProbeStrategy
             return MaximumTestQuantity;
         }
 
+        private decimal RequestedQuantity(ProbeTestCommand command)
+        {
+            var value = command.Parameters.Value<decimal?>("quantity") ?? ValidatedQuantity();
+            if (value <= 0m || value > ValidatedQuantity())
+                throw new InvalidOperationException("test quantity is outside the configured maximum");
+            return value;
+        }
+
+        private static int RequestedOffsetTicks(ProbeTestCommand command, string name, int fallback)
+        {
+            var value = command.Parameters.Value<int?>(name) ?? fallback;
+            if (value == 0 || Math.Abs(value) > 10000)
+                throw new InvalidOperationException("test price offset is outside the allowed range");
+            return value;
+        }
+
+        private static OrderDirections RequestedDirection(ProbeTestCommand command)
+        {
+            var side = command.Parameters.Value<string>("side")?.Trim().ToLowerInvariant() ?? "buy";
+            return side switch
+            {
+                "buy" => OrderDirections.Buy,
+                "sell" => OrderDirections.Sell,
+                _ => throw new InvalidOperationException("test side must be buy or sell"),
+            };
+        }
+
         private decimal ValidatedPriceStep()
         {
             if (TestPriceStep <= 0m)
@@ -318,6 +374,8 @@ namespace AtasMt5ProbeStrategy
             if (_disposed)
                 return;
             _disposed = true;
+            _heartbeatTimer?.Dispose();
+            _heartbeatTimer = null;
             _client?.Dispose();
             _client = null;
             StrategyLog.Append("Test driver stopped\n");

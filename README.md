@@ -41,6 +41,22 @@ report.  It deliberately does **not** enable MT5 execution.
    Invoke-RestMethod -Uri "http://127.0.0.1:8769/v1/test/runs/$($run.run_id)" -Headers $headers
    ```
 
+   The test plan is hot-loaded by the local service; no ATAS reload is needed
+   for a new bounded script. For example, this sends a distant sell limit,
+   moves it, then cancels it:
+
+   ```powershell
+   $body = @'
+   {"scenario":"pending_script","steps":[
+     {"id":"entry","action":"open_pending","parameters":{"side":"sell","quantity":"1","price_offset_ticks":100}},
+     {"id":"move","action":"modify_pending","parameters":{"order_ref":"entry","price_offset_ticks":120}},
+     {"id":"cancel","action":"cancel_pending","parameters":{"order_ref":"entry"}}
+   ]}
+   '@
+   Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8769/v1/test/runs `
+     -Headers $headers -ContentType 'application/json' -Body $body
+   ```
+
 The run record is appended to `probe-data-demo/test_runs.jsonl`. To stop an
 in-progress test, post `{}` to `/v1/test/runs/<run-id>/abort` with the same
 header; an observed active test order is then cancelled. The test API binds

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -92,6 +93,23 @@ def test_gateway_parses_bridge_filtered_snapshot_queues_once_and_accepts_ea_rece
     assert receipt.status == OperationStatus.ACCEPTED
 
 
+def test_gateway_retains_only_the_latest_in_memory_m1_window():
+    gateway = Mt5HttpGateway("XAUUSD", 26081001)
+    payload = snapshot()
+    payload["m1_bars"] = [
+        {"time_utc": "2026-08-10T09:00:00+00:00", "close": "4001.2"},
+        {"time_utc": "2026-08-10T09:01:00+00:00", "close": "4001.3"},
+        {"time_utc": "", "close": "bad"},
+    ]
+
+    gateway.ingest_snapshot(payload)
+
+    assert gateway.latest_m1_history() == (
+        {"time_utc": "2026-08-10T09:00:00+00:00", "close": "4001.2"},
+        {"time_utc": "2026-08-10T09:01:00+00:00", "close": "4001.3"},
+    )
+
+
 def test_gateway_rejects_a_snapshot_from_another_magic_number():
     gateway = Mt5HttpGateway("XAUUSD", 26081001)
     invalid = {**snapshot(), "bridge_magic": 1}
@@ -148,6 +166,86 @@ def test_live_controller_caches_mt5_state_before_atas_snapshot_without_planning(
         controller.close()
 
 
+def test_observation_mode_collects_and_exposes_basis_samples(tmp_path: Path):
+    controller = LiveBridgeController(
+        source_symbol="GC",
+        target_symbol="XAUUSD",
+        bridge_magic=26081001,
+        database_path=tmp_path / "bridge.db",
+        journal_path=tmp_path / "operations.jsonl",
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        controller.handle_mt5_snapshot(snapshot())
+        controller.handle_atas_message(
+            {
+                "session_id": "atas-session",
+                "event_id": 1,
+                "event_type": "state_snapshot",
+                "source_symbol": "GC",
+                "atas_timestamp_utc": now,
+                "data": {"position_known": True, "last_observed_position": {"security": "GC", "volume": "0", "average_price": "0"}, "orders": []},
+            }
+        )
+        controller.handle_atas_message(
+            {
+                "session_id": "atas-session",
+                "event_id": 2,
+                "event_type": "quote",
+                "source_symbol": "GC",
+                "atas_timestamp_utc": now,
+                "data": {"best_bid": "3990", "best_ask": "3990.2"},
+            }
+        )
+        status = controller.status()
+        assert status["execution_enabled"] is False
+        assert status["basis"]["sample_count"] == 1  # type: ignore[index]
+        assert status["basis"]["current_buy_basis"] == "10.0"  # type: ignore[index]
+    finally:
+        controller.close()
+
+
+def test_controller_rebuilds_basis_only_from_matching_m1_windows(tmp_path: Path):
+    controller = LiveBridgeController(
+        source_symbol="GC",
+        target_symbol="XAUUSD",
+        bridge_magic=26081001,
+        database_path=tmp_path / "bridge.db",
+        journal_path=tmp_path / "operations.jsonl",
+    )
+    try:
+        minute = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        first_minute = (minute - timedelta(minutes=2)).isoformat()
+        second_minute = (minute - timedelta(minutes=1)).isoformat()
+        target = snapshot()
+        target["m1_bars"] = [
+            {"time_utc": first_minute, "close": "4010"},
+            {"time_utc": second_minute, "close": "4012"},
+        ]
+        controller.handle_mt5_snapshot(target)
+        controller.handle_atas_message(
+            {
+                "session_id": "basis-session",
+                "event_id": 1,
+                "event_type": "basis_history",
+                "source_symbol": "GC",
+                "data": {
+                    "bars": [
+                        {"time_utc": first_minute, "close": "4000"},
+                        {"time_utc": second_minute, "close": "4001"},
+                    ]
+                },
+            }
+        )
+
+        status = controller.status()
+        assert status["basis_history"] == {"source_m1_bars": 2, "target_m1_bars": 2}
+        assert status["basis"]["sample_count"] == 2  # type: ignore[index]
+        assert status["basis"]["estimated_buy_basis"] == "11"  # type: ignore[index]
+    finally:
+        controller.close()
+
+
 def test_test_driver_events_do_not_reset_the_live_source_session(tmp_path: Path):
     test_control = DemoTestController(enabled=True, token="test-token", report_path=tmp_path / "test-runs.jsonl")
     controller = LiveBridgeController(
@@ -170,6 +268,14 @@ def test_test_driver_events_do_not_reset_the_live_source_session(tmp_path: Path)
         created = test_control.create_run({})
         assert test_control.command_for_ack("test-driver-session") is not None
         assert created["scenario"] == "pending_lifecycle"
+        controller.handle_atas_message(
+            {
+                "session_id": "test-driver-session",
+                "event_type": "test_driver_heartbeat",
+                "data": {},
+            }
+        )
+        assert controller.status()["source_synchronized"] is False
     finally:
         controller.close()
 

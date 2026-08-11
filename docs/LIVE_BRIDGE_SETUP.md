@@ -41,21 +41,28 @@ number, the bridge quarantines the symbol and submits nothing.
      --token 'replace-with-a-long-local-token'
    ```
 
-4. Configure the ATAS probe WebSocket as `ws://127.0.0.1:8767`. Confirm that
+4. Configure the ATAS probe WebSocket as `ws://127.0.0.1:8767`. Add the
+   separate `AtasMt5BasisCollector` strategy to a dedicated **GC M1** chart;
+   keep its source symbol as `GC`, set its chart UTC offset to `480`, and keep
+   the main trading chart on any timeframe you prefer. The collector exports
+   the most recent 240 *closed* M1 bars once per minute and has no trading
+   capability. Confirm that
    the bridge receives a full ATAS snapshot and the EA posts a complete MT5
    snapshot. The `/v1/status` endpoint (with the token header) must show both
    `source_synchronized=true` and `source_position_complete=true` before
    relying on position repair. If ATAS has not yet pushed the existing
    position after strategy start, the bridge deliberately treats it as unknown
-   rather than as flat. First collect at least 20 paired quote samples while
-   execution is off.
+   rather than as flat. Before execution, `/v1/status` must also show at least
+   180 source and target M1 bars and at least 180 basis samples. Raw bars and
+   a previous process's basis are not kept in SQLite: the calibration is
+   rebuilt from the recent intraday windows after every bridge start.
 5. For a demo test only, start the service with `--enable-execution` **and**
    set EA `EnableExecution=true`. Both gates are necessary. Keep volume at the
    broker's minimum until the observed lifecycle is understood.
 
-`bridge-state/bridge.db` stores source checkpoints, intent/leg mapping,
-operation records, and up to four hours of basis samples. Copy this database
-before changing bridge versions; do not remove it to clear an incident.
+`bridge-state/bridge.db` stores source checkpoints, intent/leg mapping, and
+operation records. Copy this database before changing bridge versions; do not
+remove it to clear an incident. Basis calibration is intentionally not stored.
 
 ## State machines
 
@@ -145,17 +152,17 @@ complex “must always be one-directional” MT5 state machine.
   disconnect only quote events are capped (20 by default); order/position
   events and periodic authoritative snapshots remain queued. MT5 and ATAS
   callbacks are serialized by symbol inside the service.
-- Quotes must be fresh (250 ms), basis history must have 20 samples, and the
+- Quotes must be fresh (250 ms), basis history must have 180 matching closed
+  M1 samples, and the
   current side basis cannot deviate more than 2.00 or have dispersion above
   1.00. ATAS freshness uses its callback timestamp; MT5 freshness uses the
   local bridge's receipt time for each complete EA snapshot, avoiding the
   EA/server clock's one-second timestamp precision. These are deliberately
   conservative starting values to tune from logged GC/XAUUSD data, not
   trading recommendations.
-- The estimator retains a four-hour window but samples no faster than once per
-  second and checkpoints its basis state every five seconds. Raw 20 Hz probe
-  quotes remain in JSONL for latency analysis; they are not synchronously
-  written to SQLite on every tick.
+- The estimator uses the latest four-hour M1 window. It is reconstructed from
+  the ATAS GC M1 collector and MT5 `CopyRates(..., PERIOD_M1, 1, 240, ...)`
+  on startup and each minute. Raw bars and basis samples are not persisted.
 - MT5 volume, tick size, stops level and freeze level are checked before
   pending order creation. The mapped price is rounded only to the target tick.
 - The initial executable mapping covers direct pending-order mirroring,

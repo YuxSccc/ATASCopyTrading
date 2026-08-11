@@ -36,12 +36,11 @@ def test_pending_lifecycle_requires_receipts_and_tracks_recreated_order(tmp_path
     run_id = str(created["run_id"])
 
     control.observe_probe_event({"event_type": "test_driver_ready", "session_id": "test-driver", "data": {}})
-    assert control.command_for_ack("test-driver") == {
-        "command_id": f"{run_id}:open_pending",
-        "run_id": run_id,
-        "command": "open_pending",
-        "token": "test-token",
-    }
+    command = control.command_for_ack("test-driver")
+    assert command is not None
+    assert command["command_id"] == f"{run_id}:0:open_pending"
+    assert command["command"] == "open_pending"
+    assert command["parameters"] == {"side": "buy", "order_type": "limit", "quantity": "1", "price_offset_ticks": -100}
     assert control.command_for_ack("ordinary-probe") is None
     control.observe_probe_event(_receipt(run_id, "open_pending"))
     control.observe_probe_event(_order_event(run_id, "source-1", "Active"))
@@ -63,10 +62,43 @@ def test_pending_lifecycle_requires_receipts_and_tracks_recreated_order(tmp_path
     assert (tmp_path / "runs.jsonl").read_text(encoding="utf-8")
 
 
+def test_pending_lifecycle_accepts_callbacks_that_arrive_before_command_receipts(tmp_path: Path):
+    control = DemoTestController(enabled=True, token="test-token", report_path=tmp_path / "runs.jsonl")
+    control.observe_probe_event({"event_type": "test_driver_ready", "session_id": "test-driver", "data": {}})
+    run_id = str(control.create_run({})["run_id"])
+
+    control.observe_probe_event(_order_event(run_id, "source-1", "Active"))
+    control.observe_probe_event(_receipt(run_id, "open_pending"))
+    assert control.command_for_ack("test-driver")["command"] == "modify_pending"  # type: ignore[index]
+
+    control.observe_probe_event(_order_event(run_id, "source-2", "Active"))
+    control.observe_probe_event(_receipt(run_id, "modify_pending"))
+    assert control.command_for_ack("test-driver")["command"] == "cancel_pending"  # type: ignore[index]
+
+
 def test_test_control_rejects_arbitrary_order_options(tmp_path: Path):
     control = DemoTestController(enabled=True, token="test-token", report_path=tmp_path / "runs.jsonl")
     with pytest.raises(ValueError, match="unsupported"):
         control.create_run({"quantity": "100"})
+
+
+def test_parameterized_script_is_hot_loaded_without_changing_the_driver(tmp_path: Path):
+    control = DemoTestController(enabled=True, token="test-token", report_path=tmp_path / "runs.jsonl")
+    control.observe_probe_event({"event_type": "test_driver_ready", "session_id": "test-driver", "data": {}})
+    created = control.create_run(
+        {
+            "scenario": "pending_script",
+            "steps": [
+                {"id": "short_entry", "action": "open_pending", "parameters": {"side": "sell", "quantity": "0.5", "price_offset_ticks": 80}},
+                {"id": "move", "action": "modify_pending", "parameters": {"order_ref": "short_entry", "price_offset_ticks": 120}},
+                {"id": "cleanup", "action": "cancel_pending", "parameters": {"order_ref": "short_entry"}},
+            ],
+        }
+    )
+    command = control.command_for_ack("test-driver")
+    assert command is not None
+    assert command["parameters"]["side"] == "sell"  # type: ignore[index]
+    assert command["parameters"]["quantity"] == "0.5"  # type: ignore[index]
 
 
 def test_test_http_server_uses_a_separate_token_and_can_abort(tmp_path: Path):

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, ROUND_HALF_UP
-from typing import Iterable
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from typing import Any, Iterable, Mapping
 
 from .models import SourceOrder, SourceQuote, TargetAccountState, TargetQuote, TargetSymbolSpec
 
@@ -26,11 +26,11 @@ class PriceDecision:
 
 @dataclass
 class SideBasisEstimator:
-    """Recent-weighted 4-hour GC/XAUUSD side-basis estimator."""
+    """Recent-weighted GC/XAUUSD side-basis estimator sampled once per minute."""
 
     window: timedelta = timedelta(hours=4)
     half_life: timedelta = timedelta(minutes=15)
-    minimum_sample_interval: timedelta = timedelta(seconds=1)
+    minimum_sample_interval: timedelta = timedelta(minutes=1)
     samples: list[BasisSample] = field(default_factory=list)
 
     def record(self, source: SourceQuote, target: TargetQuote) -> None:
@@ -87,9 +87,15 @@ class SideBasisEstimator:
 @dataclass(frozen=True)
 class PriceGuardConfig:
     quote_max_age: timedelta = timedelta(milliseconds=250)
-    minimum_basis_samples: int = 20
+    # A full three hours of matching closed M1 bars is required by default.
+    # The live bridge is intentionally blocked after startup until the two
+    # terminals have supplied a fresh intraday calibration window.
+    minimum_basis_samples: int = 180
     max_current_basis_deviation: Decimal = Decimal("2.00")
     max_basis_dispersion: Decimal = Decimal("1.00")
+    basis_window: timedelta = timedelta(hours=4)
+    basis_half_life: timedelta = timedelta(minutes=15)
+    minimum_sample_interval: timedelta = timedelta(minutes=1)
 
 
 @dataclass
@@ -103,40 +109,97 @@ class PriceMapper:
         if source is not None and target is not None:
             self.estimator.record(source, target)
 
+    def calibrate_from_minute_history(
+        self,
+        source_bars: Iterable[Mapping[str, Any]],
+        target_bars: Iterable[Mapping[str, Any]],
+    ) -> int:
+        """Replace the rolling calibration from matching closed M1 bars.
+
+        The bridge receives raw bars from each terminal only in memory; it
+        retains the resulting compact basis samples, not OHLC history. Exact
+        UTC minute keys prevent a chart-display timezone from changing a
+        price mapping.
+        """
+        source_by_minute = _minute_closes(source_bars)
+        target_by_minute = _minute_closes(target_bars)
+        matched_minutes = sorted(set(source_by_minute).intersection(target_by_minute))
+        samples = [
+            BasisSample(
+                occurred_at_utc=minute,
+                buy_basis=target_by_minute[minute] - source_by_minute[minute],
+                sell_basis=target_by_minute[minute] - source_by_minute[minute],
+            )
+            for minute in matched_minutes
+        ]
+        self.estimator.samples = samples[-int(self.estimator.window.total_seconds() // 60) :]
+        return len(self.estimator.samples)
+
     def to_data(self) -> dict:
+        """Export no historical calibration data.
+
+        The basis is deliberately rebuilt from the latest closed M1 windows
+        after every service start.  Persisting old GC/XAUUSD samples would
+        make a stale session look ready before the current feeds were
+        observed.  The empty shape is retained only for compatibility with an
+        existing database schema.
+        """
         return {
             "window_seconds": self.estimator.window.total_seconds(),
             "half_life_seconds": self.estimator.half_life.total_seconds(),
             "minimum_sample_interval_seconds": self.estimator.minimum_sample_interval.total_seconds(),
-            "samples": [
-                {
-                    "occurred_at_utc": sample.occurred_at_utc.isoformat(),
-                    "buy_basis": str(sample.buy_basis),
-                    "sell_basis": str(sample.sell_basis),
-                }
-                for sample in self.estimator.samples
-            ],
+            "samples": [],
+        }
+
+    def diagnostics(
+        self,
+        source_quote: SourceQuote | None,
+        target_quote: TargetQuote | None,
+        now: datetime | None = None,
+    ) -> dict[str, object]:
+        """Return read-only calibration state for the local status endpoint."""
+        now = now or datetime.now(timezone.utc)
+        buy_basis = self.estimator.current_basis("buy", source_quote, target_quote) if source_quote and target_quote else None
+        sell_basis = self.estimator.current_basis("sell", source_quote, target_quote) if source_quote and target_quote else None
+        return {
+            "sample_count": len(self.estimator.samples),
+            "minimum_samples": self.config.minimum_basis_samples,
+            "window_seconds": int(self.estimator.window.total_seconds()),
+            "half_life_seconds": int(self.estimator.half_life.total_seconds()),
+            "quote_max_age_ms": int(self.config.quote_max_age.total_seconds() * 1000),
+            "max_current_basis_deviation": str(self.config.max_current_basis_deviation),
+            "max_basis_dispersion": str(self.config.max_basis_dispersion),
+            "last_sample_at_utc": self.estimator.samples[-1].occurred_at_utc.isoformat() if self.estimator.samples else None,
+            "current_buy_basis": str(buy_basis) if buy_basis is not None else None,
+            "current_sell_basis": str(sell_basis) if sell_basis is not None else None,
+            "estimated_buy_basis": _decimal_text(self.estimator.estimate("buy", now)),
+            "estimated_sell_basis": _decimal_text(self.estimator.estimate("sell", now)),
+            "buy_basis_dispersion": _decimal_text(self.estimator.dispersion("buy", now)),
+            "sell_basis_dispersion": _decimal_text(self.estimator.dispersion("sell", now)),
         }
 
     @classmethod
     def from_data(cls, data: dict | None, config: PriceGuardConfig | None = None) -> "PriceMapper":
+        config = config or PriceGuardConfig()
         if not data:
-            return cls(config=config or PriceGuardConfig())
+            return cls(
+                estimator=SideBasisEstimator(
+                    window=config.basis_window,
+                    half_life=config.basis_half_life,
+                    minimum_sample_interval=config.minimum_sample_interval,
+                ),
+                config=config,
+            )
         estimator = SideBasisEstimator(
-            window=timedelta(seconds=float(data["window_seconds"])),
-            half_life=timedelta(seconds=float(data["half_life_seconds"])),
-            minimum_sample_interval=timedelta(seconds=float(data.get("minimum_sample_interval_seconds", 1))),
-            samples=[
-                BasisSample(
-                    occurred_at_utc=_parse_time(str(item["occurred_at_utc"])),
-                    buy_basis=Decimal(str(item["buy_basis"])),
-                    sell_basis=Decimal(str(item["sell_basis"])),
-                )
-                for item in data.get("samples", [])
-            ],
+            window=config.basis_window,
+            half_life=config.basis_half_life,
+            minimum_sample_interval=config.minimum_sample_interval,
+            # Do not restore old persisted calibration.  Fresh M1 windows
+            # must establish the basis for this bridge process.
+            samples=[],
         )
         estimator.prune(datetime.now(timezone.utc))
-        return cls(estimator=estimator, config=config or PriceGuardConfig())
+        return cls(estimator=estimator, config=config)
 
     def map_pending(
         self,
@@ -240,6 +303,25 @@ def _map_price(value: Decimal | None, basis: Decimal, tick_size: Decimal) -> Dec
     if tick_size <= 0:
         raise ValueError("tick_size must be positive")
     return ((value + basis) / tick_size).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * tick_size
+
+
+def _decimal_text(value: Decimal | None) -> str | None:
+    return str(value) if value is not None else None
+
+
+def _minute_closes(bars: Iterable[Mapping[str, Any]]) -> dict[datetime, Decimal]:
+    result: dict[datetime, Decimal] = {}
+    for bar in bars:
+        raw_time = bar.get("time_utc")
+        raw_close = bar.get("close")
+        if raw_time in (None, "") or raw_close in (None, ""):
+            continue
+        try:
+            occurred_at = _parse_time(str(raw_time)).replace(second=0, microsecond=0)
+            result[occurred_at] = Decimal(str(raw_close))
+        except (InvalidOperation, ValueError):
+            continue
+    return result
 
 
 def _has_pending_semantics(

@@ -41,6 +41,7 @@ class Mt5HttpGateway(TargetExecutionPort):
     _state_received_at: float = field(default=0.0, init=False)
     _queued_commands: dict[str, BridgeCommand] = field(default_factory=dict, init=False)
     _acknowledged_receipts: dict[str, ExecutionReceipt] = field(default_factory=dict, init=False)
+    _m1_history: tuple[dict[str, object], ...] = field(default=(), init=False)
     _lock: RLock = field(default_factory=RLock, init=False)
 
     def read_state(self, target_symbol: str) -> TargetAccountState:
@@ -93,6 +94,9 @@ class Mt5HttpGateway(TargetExecutionPort):
         with self._lock:
             self._state = state
             self._state_received_at = monotonic()
+            history = _parse_m1_history(payload.get("m1_bars"))
+            if history:
+                self._m1_history = history
         return state
 
     def next_commands(self, limit: int = 1) -> tuple[BridgeCommand, ...]:
@@ -121,6 +125,20 @@ class Mt5HttpGateway(TargetExecutionPort):
                 "fresh": age_seconds <= self.snapshot_ttl_seconds,
                 "age_ms": round(age_seconds * 1000),
             }
+
+    def latest_state(self) -> TargetAccountState | None:
+        """Return the most recent complete snapshot for diagnostics only.
+
+        Planning and command delivery must still use :meth:`read_state`, which
+        rejects stale data. The status endpoint needs to explain *why* a guard
+        is blocking without weakening that execution rule.
+        """
+        with self._lock:
+            return self._state
+
+    def latest_m1_history(self) -> tuple[dict[str, object], ...]:
+        with self._lock:
+            return self._m1_history
 
     def restore_unresolved_command(self, command: BridgeCommand) -> None:
         """Make a pre-restart request acknowledgeable without re-delivering it.
@@ -235,6 +253,22 @@ def _parse_quote(data: object, symbol: str, observed_at_utc: str) -> TargetQuote
         ask=_optional_decimal(data.get("ask")),
         occurred_at_utc=observed_at_utc,
     )
+
+
+def _parse_m1_history(data: object) -> tuple[dict[str, object], ...]:
+    """Keep at most one in-memory closed-bar calibration window from the EA."""
+    if not isinstance(data, list):
+        return ()
+    bars: list[dict[str, object]] = []
+    for item in data[-240:]:
+        if not isinstance(item, Mapping):
+            continue
+        time_utc = str(item.get("time_utc", "")).strip()
+        close = item.get("close")
+        if not time_utc or close in (None, ""):
+            continue
+        bars.append({"time_utc": time_utc, "close": str(close)})
+    return tuple(bars)
 
 
 def _parse_symbol_spec(data: object) -> TargetSymbolSpec | None:

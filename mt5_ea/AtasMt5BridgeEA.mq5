@@ -10,6 +10,10 @@ input int SnapshotIntervalMilliseconds = 100;
 input int HttpTimeoutMilliseconds = 1000;
 
 ulong g_last_snapshot_tick = 0;
+ulong g_last_m1_history_tick = 0;
+bool g_m1_history_dirty = false;
+string g_m1_bars_json = "";
+int g_m1_server_utc_offset_seconds = 0;
 string g_pending_receipt_body = "";
 string g_last_command_id = "";
 string g_last_command_phase = "";
@@ -24,6 +28,7 @@ int OnInit()
    }
    LoadCommandState();
    EventSetMillisecondTimer((int)MathMax(10, SnapshotIntervalMilliseconds));
+   RefreshM1History(true);
    string health_response;
    int health_status = 0;
    if(!Http("GET", "/v1/status", "", health_response, health_status))
@@ -47,6 +52,7 @@ void OnTimer()
    if(!FlushPendingReceipt())
       return;
    ulong now = GetTickCount();
+   RefreshM1History(false);
    bool snapshot_posted = false;
    if(now - g_last_snapshot_tick >= (ulong)MathMax(10, SnapshotIntervalMilliseconds))
       snapshot_posted = PublishSnapshot();
@@ -69,7 +75,8 @@ void OnTradeTransaction(const MqlTradeTransaction &transaction,
 
 bool PublishSnapshot()
 {
-   string body = BuildSnapshotJson();
+   bool include_history = g_m1_history_dirty;
+   string body = BuildSnapshotJson(include_history);
    string response;
    int status = 0;
    if(!Http("POST", "/v1/mt5/snapshot", body, response, status))
@@ -77,11 +84,13 @@ bool PublishSnapshot()
       PrintFormat("ATAS bridge snapshot POST failed, HTTP=%d", status);
       return false;
    }
+   if(include_history)
+      g_m1_history_dirty = false;
    g_last_snapshot_tick = GetTickCount();
    return true;
 }
 
-string BuildSnapshotJson()
+string BuildSnapshotJson(bool include_history)
 {
    MqlTick tick = {};
    SymbolInfoTick(_Symbol, tick);
@@ -150,18 +159,47 @@ string BuildSnapshotJson()
    string account_model = AccountInfoInteger(ACCOUNT_MARGIN_MODE) == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING
                           ? "hedging" : "netting";
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   string history = include_history
+                    ? StringFormat("\"m1_bars\":[%s],\"m1_server_utc_offset_seconds\":%d,", g_m1_bars_json, g_m1_server_utc_offset_seconds)
+                    : "";
    return StringFormat(
-      "{\"target_symbol\":\"%s\",\"bridge_magic\":%I64d,\"account_model\":\"%s\",\"snapshot_complete\":true,"
+      "{\"target_symbol\":\"%s\",\"bridge_magic\":%I64d,\"account_model\":\"%s\",\"snapshot_complete\":true,%s"
       "\"long_quantity\":\"%s\",\"short_quantity\":\"%s\",\"quote\":{\"bid\":\"%s\",\"ask\":\"%s\",\"occurred_at_utc\":\"%s\"},"
       "\"symbol_spec\":{\"tick_size\":\"%s\",\"volume_min\":\"%s\",\"volume_max\":\"%s\",\"volume_step\":\"%s\",\"stops_level\":\"%s\",\"freeze_level\":\"%s\"},"
       "\"pending_orders\":[%s],\"positions\":[%s],\"foreign_symbol_objects_present\":%s}",
-      EscapeJson(_Symbol), BridgeMagic, account_model, Number(long_volume), Number(short_volume),
+      EscapeJson(_Symbol), BridgeMagic, account_model, history, Number(long_volume), Number(short_volume),
       Number(tick.bid), Number(tick.ask), UtcIso(TimeGMT()),
       Number(SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE)), Number(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN)),
       Number(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX)), Number(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP)),
       Number((double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * point),
       Number((double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL) * point), orders, positions,
       foreign_symbol_objects_present ? "true" : "false");
+}
+
+void RefreshM1History(bool force)
+{
+   ulong now = GetTickCount();
+   if(!force && now - g_last_m1_history_tick < 60000)
+      return;
+   g_last_m1_history_tick = now;
+   MqlRates rates[];
+   int copied = CopyRates(_Symbol, PERIOD_M1, 1, 240, rates);
+   if(copied < 180)
+   {
+      PrintFormat("ATAS bridge M1 history unavailable or incomplete: copied=%d", copied);
+      return;
+   }
+   g_m1_server_utc_offset_seconds = (int)(TimeCurrent() - TimeGMT());
+   string bars = "";
+   for(int index = 0; index < copied; index++)
+   {
+      if(index > 0)
+         bars += ",";
+      datetime utc_time = rates[index].time - g_m1_server_utc_offset_seconds;
+      bars += StringFormat("{\"time_utc\":\"%s\",\"close\":\"%s\"}", UtcIso(utc_time), Number(rates[index].close));
+   }
+   g_m1_bars_json = bars;
+   g_m1_history_dirty = true;
 }
 
 void PollAndExecuteOneCommand()
