@@ -146,7 +146,7 @@ class LiveBridgeController:
         directory = self.basis_recording_directory
         if directory is None or not directory.is_dir():
             return
-        best: tuple[dict[str, object], ...] = ()
+        recovered: tuple[dict[str, object], ...] = ()
         for path in directory.glob("atas_probe_*.jsonl"):
             try:
                 with path.open("r", encoding="utf-8") as stream:
@@ -161,12 +161,15 @@ class LiveBridgeController:
                         bars = data.get("bars") if isinstance(data, Mapping) else None
                         if not isinstance(bars, list):
                             continue
-                        candidate = _merge_minute_bars((), bars)
-                        if len(candidate) > len(best):
-                            best = candidate
+                        # A newly restarted collector often has only the
+                        # current minute in addition to a pre-halt response.
+                        # Merge every recorded response by minute instead of
+                        # selecting the numerically longest (possibly older)
+                        # one, then keep the rolling newest 240 below.
+                        recovered = _merge_minute_bars(recovered, bars)
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 continue
-        self._source_m1_history = best
+        self._source_m1_history = recovered
 
     def _refresh_history_calibration(self) -> None:
         mapper = self.coordinator.policy.price_mapper
