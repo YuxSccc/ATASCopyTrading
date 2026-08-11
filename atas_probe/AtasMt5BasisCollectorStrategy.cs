@@ -43,8 +43,9 @@ namespace AtasMt5ProbeStrategy
         public string SourceSymbolOverride { get; set; } = "GC";
 
         [OFT.Attributes.ParameterAttribute]
-        [DisplayName("ATAS chart UTC offset minutes")]
-        public int AtasChartUtcOffsetMinutes { get; set; } = 480;
+        [DisplayName("ATAS API timestamp UTC offset minutes")]
+        [Description("Offset encoded in MarketDataArg.Time. Keep 0 when the connector returns UTC, regardless of the chart display timezone.")]
+        public int AtasApiTimestampUtcOffsetMinutes { get; set; } = 0;
 
         [OFT.Attributes.ParameterAttribute]
         [DisplayName("Closed M1 minutes to export")]
@@ -70,9 +71,11 @@ namespace AtasMt5ProbeStrategy
             {
                 chart_type = ChartInfo?.ChartType ?? "",
                 time_frame = ChartInfo?.TimeFrame ?? "",
-                collector_mode = "trades_cache",
+                collector_mode = "historical_cumulative_trades",
                 requested_bars = Math.Max(1, HistoryBars),
-                atas_chart_utc_offset_minutes = AtasChartUtcOffsetMinutes,
+                atas_api_timestamp_utc_offset_minutes = AtasApiTimestampUtcOffsetMinutes,
+                atas_utc_time = UtcTime.ToString("O"),
+                atas_market_time = MarketTime.ToString("O"),
             });
             RequestHistoricalWindow();
             StrategyLog.Append($"Basis collector started session={_sessionId}, source={GetSourceSymbol()}\n");
@@ -171,17 +174,20 @@ namespace AtasMt5ProbeStrategy
         {
             if (_historicalRequestInFlight)
                 return;
-            var endChartTime = DateTime.UtcNow.AddMinutes(AtasChartUtcOffsetMinutes);
-            var startChartTime = endChartTime.AddMinutes(-Math.Max(1, HistoryBars));
+            // Historical requests use ATAS' provider UTC clock, not the
+            // chart's UI display timezone. Chart timezone settings only affect
+            // rendering; shifting this request made it ask for a future range.
+            var endUtcTime = UtcTime;
+            var startUtcTime = endUtcTime.AddMinutes(-Math.Max(1, HistoryBars));
             _historicalRequestInFlight = true;
-            RequestForCumulativeTrades(new CumulativeTradesRequest(startChartTime, endChartTime, 0, 0));
-            StrategyLog.Append($"Basis historical window requested start={startChartTime:O}, end={endChartTime:O}\n");
+            RequestForCumulativeTrades(new CumulativeTradesRequest(startUtcTime, endUtcTime, 0, 0));
+            StrategyLog.Append($"Basis historical window requested start={startUtcTime:O}, end={endUtcTime:O}\n");
         }
 
         private void AddTrade(DateTime chartTime, decimal price)
         {
-            var localTime = DateTime.SpecifyKind(chartTime, DateTimeKind.Unspecified);
-            var utcTime = localTime.AddMinutes(-AtasChartUtcOffsetMinutes);
+            var apiTime = DateTime.SpecifyKind(chartTime, DateTimeKind.Unspecified);
+            var utcTime = apiTime.AddMinutes(-AtasApiTimestampUtcOffsetMinutes);
             var minute = new DateTime(utcTime.Year, utcTime.Month, utcTime.Day, utcTime.Hour, utcTime.Minute, 0, DateTimeKind.Utc);
             if (minute < CurrentUtcMinute())
                 _minuteCloses[minute] = price;

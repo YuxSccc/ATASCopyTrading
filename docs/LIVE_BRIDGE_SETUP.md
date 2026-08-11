@@ -44,7 +44,9 @@ number, the bridge quarantines the symbol and submits nothing.
 4. Configure the ATAS probe WebSocket as `ws://127.0.0.1:8767`. Add the
    separate `AtasMt5BasisCollector` strategy to the **same GC trading chart**;
    it may remain on H1 or any other period. Keep its source symbol as `GC` and
-   set its chart UTC offset to `480`. On startup the collector requests the
+   keep its `ATAS API timestamp UTC offset minutes` at `0` unless the connector
+   itself returns non-UTC timestamps. This is independent of the chart's
+   display timezone. On startup the collector requests the
    previous 240 minutes of ATAS historical cumulative trades, aggregates their
    M1 closes, and then uses the recent trade cache to keep that window moving.
    It has no trading capability. Confirm that
