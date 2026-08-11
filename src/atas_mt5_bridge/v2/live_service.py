@@ -129,10 +129,6 @@ def start_mt5_http_server(controller: LiveBridgeController, host: str, port: int
 
 def _make_handler(controller: LiveBridgeController, token: str):
     class Mt5Handler(BaseHTTPRequestHandler):
-        # MT5's built-in WebRequest client is more reliable with an explicit
-        # HTTP/1.1 response and a framed body than with the handler default.
-        protocol_version = "HTTP/1.1"
-
         def do_GET(self) -> None:  # noqa: N802
             if not self._authorized():
                 self._respond(404, "")
@@ -189,10 +185,8 @@ def _make_handler(controller: LiveBridgeController, token: str):
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(encoded)))
-            self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(encoded)
-            self.close_connection = True
 
     return Mt5Handler
 
