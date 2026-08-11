@@ -24,6 +24,12 @@ int OnInit()
    }
    LoadCommandState();
    EventSetMillisecondTimer((int)MathMax(10, SnapshotIntervalMilliseconds));
+   string health_response;
+   int health_status = 0;
+   if(!Http("GET", "/v1/status", "", health_response, health_status))
+      PrintFormat("ATAS bridge health check failed, HTTP=%d", health_status);
+   else
+      Print("ATAS bridge health check succeeded");
    PublishSnapshot();
    return(INIT_SUCCEEDED);
 }

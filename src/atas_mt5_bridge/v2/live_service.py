@@ -129,6 +129,10 @@ def start_mt5_http_server(controller: LiveBridgeController, host: str, port: int
 
 def _make_handler(controller: LiveBridgeController, token: str):
     class Mt5Handler(BaseHTTPRequestHandler):
+        # MT5's built-in WebRequest client is more reliable with an explicit
+        # HTTP/1.1 response and a framed body than with the handler default.
+        protocol_version = "HTTP/1.1"
+
         def do_GET(self) -> None:  # noqa: N802
             if not self._authorized():
                 self._respond(404, "")
@@ -185,8 +189,10 @@ def _make_handler(controller: LiveBridgeController, token: str):
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(encoded)))
+            self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(encoded)
+            self.close_connection = True
 
     return Mt5Handler
 
@@ -200,20 +206,26 @@ async def serve(
 ) -> None:
     try:
         import websockets
+        from websockets.exceptions import ConnectionClosed
     except ImportError as exc:
         raise RuntimeError("websockets package is required") from exc
     recorder = ProbeRecorder(output_directory)
 
     async def handler(websocket: Any) -> None:
-        async for raw_message in websocket:
-            try:
-                payload = json.loads(raw_message)
-                event = parse_probe_event(payload)
-                acknowledgement = recorder.record(event)
-                controller.handle_atas_message(payload)
-                await websocket.send(json.dumps(acknowledgement, ensure_ascii=False))
-            except (json.JSONDecodeError, ProbeProtocolError, ValueError) as error:
-                await websocket.send(json.dumps({"type": "probe_error", "message": str(error)}))
+        try:
+            async for raw_message in websocket:
+                try:
+                    payload = json.loads(raw_message)
+                    event = parse_probe_event(payload)
+                    acknowledgement = recorder.record(event)
+                    controller.handle_atas_message(payload)
+                    await websocket.send(json.dumps(acknowledgement, ensure_ascii=False))
+                except (json.JSONDecodeError, ProbeProtocolError, ValueError) as error:
+                    await websocket.send(json.dumps({"type": "probe_error", "message": str(error)}))
+        except ConnectionClosed:
+            # ATAS reconnects its local WebSocket after transient failures.
+            # A peer that disappears without a close frame is not a server error.
+            return
 
     output_directory.mkdir(parents=True, exist_ok=True)
     async with websockets.serve(handler, websocket_host, websocket_port, ping_interval=20, ping_timeout=10):

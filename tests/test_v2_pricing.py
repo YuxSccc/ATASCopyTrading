@@ -135,13 +135,15 @@ def test_stale_quote_blocks_mapping():
 
 def test_basis_history_round_trips_for_database_restart_recovery():
     mapper = PriceMapper(config=PriceGuardConfig(minimum_basis_samples=1))
-    source, target = quote()
+    now = datetime.now(timezone.utc)
+    source = SourceQuote("GC", Decimal("3999"), Decimal("4000"), now.isoformat())
+    target = TargetQuote("XAUUSD", Decimal("4009"), Decimal("4010"), now.isoformat())
     mapper.record_pair(source, target)
 
     restored = PriceMapper.from_data(mapper.to_data(), config=mapper.config)
 
-    assert restored.estimator.estimate("buy", NOW) == Decimal("10")
-    assert restored.estimator.estimate("sell", NOW) == Decimal("10")
+    assert restored.estimator.estimate("buy", now) == Decimal("10")
+    assert restored.estimator.estimate("sell", now) == Decimal("10")
 
 
 def test_price_guard_validates_the_volume_after_the_configured_mapping_multiplier():
