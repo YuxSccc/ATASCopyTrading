@@ -103,11 +103,12 @@ class SourceStateBook:
         if event.event_type == SourceEventType.SNAPSHOT:
             self._position = event.position
             self._position_complete = event.position_complete if event.position_complete is not None else event.position is not None
-            self._active_orders = {
-                order.source_order_id: order
-                for order in event.snapshot_orders
-                if order.is_active
-            }
+            if event.snapshot_orders_complete:
+                self._active_orders = {
+                    order.source_order_id: order
+                    for order in event.snapshot_orders
+                    if order.is_active
+                }
         elif event.event_type == SourceEventType.POSITION:
             self._position = event.position
             self._position_complete = True

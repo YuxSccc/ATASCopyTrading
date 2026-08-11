@@ -121,6 +121,31 @@ def test_new_order_after_cancellation_is_an_independent_instance():
     assert result.source_state.active_orders["84"].price == Decimal("3986.2")
 
 
+def test_incomplete_recovery_snapshot_does_not_erase_callback_observed_order():
+    port = FakeExecutionPort()
+    coordinator = SymbolCoordinator("COMEX Gold", "XAUUSD", port)
+    coordinator.handle(snapshot_event())
+    coordinator.handle(order_event(2, active_order("manual-83")))
+
+    # ATAS ChartStrategy can see a manually created order through callbacks
+    # while its Orders collection remains empty. That diagnostic/recovery
+    # snapshot must retain the callback-derived order state.
+    incomplete = SourceEvent(
+        session_id="session-a",
+        event_id=3,
+        event_type=SourceEventType.SNAPSHOT,
+        source_symbol="COMEX Gold",
+        occurred_at_utc="2026-08-08T04:00:01Z",
+        position=SourcePosition("COMEX Gold", Decimal("0"), None),
+        snapshot_orders=(),
+        snapshot_orders_complete=False,
+    )
+
+    result = coordinator.handle(incomplete)
+
+    assert set(result.source_state.active_orders) == {"manual-83"}
+
+
 def test_gap_blocks_planning_until_a_snapshot_arrives():
     port = FakeExecutionPort()
     coordinator = SymbolCoordinator("COMEX Gold", "XAUUSD", port, policy=OneCommandPolicy())

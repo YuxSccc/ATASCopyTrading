@@ -138,6 +138,11 @@ class SourceEvent:
     position: SourcePosition | None = None
     quote: SourceQuote | None = None
     snapshot_orders: tuple[SourceOrder, ...] = ()
+    # A probe may know the net position at startup while ATAS has not exposed
+    # a complete enumeration of manually created pending orders. Such a
+    # snapshot establishes event sequencing but must not delete orders already
+    # observed through callbacks in the same session.
+    snapshot_orders_complete: bool = True
     position_complete: bool | None = None
 
     def __post_init__(self) -> None:

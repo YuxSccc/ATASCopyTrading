@@ -38,6 +38,7 @@ def parse_probe_message(message: Mapping[str, Any]) -> SourceEvent:
             event_type=SourceEventType.SNAPSHOT,
             position=position,
             snapshot_orders=tuple(_parse_order(order) for order in raw_orders if isinstance(order, Mapping)),
+            snapshot_orders_complete=bool(data.get("orders_complete", True)),
             position_complete=bool(data.get("position_known", position is not None)),
             **common,
         )

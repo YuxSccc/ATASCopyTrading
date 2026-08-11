@@ -20,7 +20,7 @@ namespace AtasMt5ProbeStrategy
     [DisplayName("AtasMt5BridgeProbe")]
     public sealed class AtasBridgeProbeStrategy : ChartStrategy
     {
-        private const string BuildTag = "2026-08-08-probe-v1";
+        private const string BuildTag = "2026-08-12-probe-v2";
         private ProbeWebSocketClient? _client;
         private string _sessionId = "";
         private long _eventSequence;
@@ -34,7 +34,23 @@ namespace AtasMt5ProbeStrategy
         private decimal? _lastCapturedPositionVolume;
         private decimal? _lastCapturedAveragePrice;
         private object? _lastObservedPositionData;
+        // ChartStrategy.Orders contains orders submitted by the strategy
+        // itself, but does not reliably contain manually placed chart orders.
+        // The order callbacks do see those orders, so recovery snapshots must
+        // be built from callback-derived state rather than Orders.
+        private readonly object _observedOrdersLock = new object();
+        private readonly Dictionary<string, ObservedOrder> _observedOrders = new Dictionary<string, ObservedOrder>();
         private bool _disposed;
+
+        private sealed class ObservedOrder
+        {
+            public ObservedOrder(object data)
+            {
+                Data = data;
+            }
+
+            public object Data { get; }
+        }
 
         [OFT.Attributes.ParameterAttribute]
         [DisplayName("Probe WebSocket URL")]
@@ -82,6 +98,8 @@ namespace AtasMt5ProbeStrategy
             _lastCapturedPositionVolume = null;
             _lastCapturedAveragePrice = null;
             _lastObservedPositionData = null;
+            lock (_observedOrdersLock)
+                _observedOrders.Clear();
             _outboxBacklog = 0;
             _droppedQuoteEvents = 0;
             _latestCriticalEventId = 0;
@@ -131,7 +149,8 @@ namespace AtasMt5ProbeStrategy
             if (_disposed || !IsCurrentChartSecurity(order.Security?.ToString()))
                 return;
 
-            Emit("order_new", BuildOrderData(order));
+            var data = ObserveOrder(order);
+            Emit("order_new", data);
             MaybeEmitRecoverySnapshot(force: true);
         }
 
@@ -140,7 +159,8 @@ namespace AtasMt5ProbeStrategy
             if (_disposed || !IsCurrentChartSecurity(order.Security?.ToString()))
                 return;
 
-            Emit("order_changed", BuildOrderData(order));
+            var data = ObserveOrder(order);
+            Emit("order_changed", data);
             MaybeEmitRecoverySnapshot(force: true);
         }
 
@@ -190,15 +210,16 @@ namespace AtasMt5ProbeStrategy
                     capture_unchanged_positions = CaptureUnchangedPositions,
                 });
 
-                var orders = Orders
-                    .Where(order => IsCurrentChartSecurity(order.Security?.ToString()))
-                    .Select(BuildOrderData)
-                    .ToArray();
                 Emit("state_snapshot", new
                 {
                     last_observed_position = _lastObservedPositionData,
                     position_known = _lastObservedPositionData != null,
-                    orders,
+                    orders = SnapshotObservedOrders(),
+                    // ATAS does not provide a reliable initial enumeration
+                    // of user-created chart orders. The stream becomes
+                    // complete only for orders observed after this strategy
+                    // starts; callback-derived snapshots never erase them.
+                    orders_complete = false,
                 });
             }
             catch (Exception ex)
@@ -333,17 +354,47 @@ namespace AtasMt5ProbeStrategy
                 return;
 
             Interlocked.Exchange(ref _lastRecoverySnapshotTicks, now);
-            var orders = Orders
-                .Where(order => IsCurrentChartSecurity(order.Security?.ToString()))
-                .Select(BuildOrderData)
-                .ToArray();
             Emit("state_snapshot", new
             {
                 last_observed_position = _lastObservedPositionData,
                 position_known = _lastObservedPositionData != null,
-                orders,
+                orders = SnapshotObservedOrders(),
+                orders_complete = false,
                 dropped_quote_events = Interlocked.Read(ref _droppedQuoteEvents),
             });
+        }
+
+        private object ObserveOrder(Order order)
+        {
+            var data = BuildOrderData(order);
+            var orderId = order.Id?.Trim() ?? "";
+            if (orderId.Length == 0)
+                return data;
+
+            lock (_observedOrdersLock)
+            {
+                if (IsActive(order))
+                    _observedOrders[orderId] = new ObservedOrder(data);
+                else
+                    _observedOrders.Remove(orderId);
+            }
+            return data;
+        }
+
+        private object[] SnapshotObservedOrders()
+        {
+            lock (_observedOrdersLock)
+                return _observedOrders.Values.Select(order => order.Data).ToArray();
+        }
+
+        private static bool IsActive(Order order)
+        {
+            // `Active` is the lifecycle value emitted by the installed ATAS
+            // connector for pending orders. A cancelled/done order must win
+            // even if an older mutable instance still reports a quantity.
+            return !order.Canceled
+                && order.Unfilled > 0m
+                && string.Equals(order.State.ToString(), "Active", StringComparison.OrdinalIgnoreCase);
         }
 
         private object BuildPositionData(Position position)
