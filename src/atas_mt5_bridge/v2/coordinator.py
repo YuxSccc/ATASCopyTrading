@@ -187,6 +187,7 @@ class SymbolCoordinator:
         expired = self.operation_book.expire_unconfirmed(self.operation_confirmation_timeout)
         if not expired:
             return False
+        self._withdraw_expired_commands(expired)
         if not self._persist_ledger_and_operations(expired):
             self.reconciliation_required = True
             return True
@@ -325,6 +326,7 @@ class SymbolCoordinator:
     def _apply_observed_target(self, target: TargetAccountState) -> bool:
         self.ledger.synchronize_target(target)
         expired = self.operation_book.expire_unconfirmed(self.operation_confirmation_timeout)
+        self._withdraw_expired_commands(expired)
         resolved = self.operation_book.resolve_from_snapshot(target, self.ledger)
         for record in resolved:
             command = record.command
@@ -429,6 +431,15 @@ class SymbolCoordinator:
                 message="target receipt command id does not match dispatched command",
             )
         return receipt
+
+    def _withdraw_expired_commands(self, expired: tuple[OperationRecord, ...]) -> None:
+        """Tell queue-backed transports not to replay quarantined commands."""
+
+        withdraw = getattr(self.execution_port, "withdraw_command", None)
+        if not callable(withdraw):
+            return
+        for record in expired:
+            withdraw(record.command.command_id)
 
     def _mark_command_dispatched(self, command: BridgeCommand) -> None:
         if command.leg_id is None:

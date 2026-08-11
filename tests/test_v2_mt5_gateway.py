@@ -146,6 +146,19 @@ def test_gateway_receipt_is_idempotent_and_a_recovered_command_is_not_redelivere
     assert restarted.acknowledge_command(receipt_payload).status == OperationStatus.ACCEPTED
 
 
+def test_gateway_quarantines_expired_command_without_rejecting_a_late_receipt():
+    gateway = Mt5HttpGateway("XAUUSD", 26081001)
+    gateway.ingest_snapshot(snapshot())
+    gateway.execute(command())
+
+    gateway.withdraw_command(command().command_id)
+
+    assert gateway.next_commands() == ()
+    assert gateway.acknowledge_command(
+        {"command_id": command().command_id, "status": "unknown", "target_reference": ""}
+    ).status == OperationStatus.UNKNOWN
+
+
 def test_live_controller_caches_mt5_state_before_atas_snapshot_without_planning(tmp_path: Path):
     controller = LiveBridgeController(
         source_symbol="GC",
@@ -300,6 +313,33 @@ def test_mt5_http_server_accepts_the_terminating_nul_sent_by_mql_webrequest(tmp_
         with urlopen(request, timeout=3) as response:
             assert response.status == 200
         assert controller.status()["target_snapshot_received"] is True
+    finally:
+        server.shutdown()
+        server.server_close()
+        controller.close()
+
+
+def test_mt5_http_server_offers_commands_over_post_for_mql_compatibility(tmp_path: Path):
+    controller = LiveBridgeController(
+        source_symbol="GC",
+        target_symbol="XAUUSD",
+        bridge_magic=26081001,
+        database_path=tmp_path / "bridge.db",
+        journal_path=tmp_path / "operations.jsonl",
+    )
+    server = start_mt5_http_server(controller, "127.0.0.1", 0, "test-token")
+    try:
+        controller.gateway.ingest_snapshot(snapshot())
+        controller.gateway.execute(command())
+        request = Request(
+            f"http://127.0.0.1:{server.server_port}/v1/mt5/command",
+            data=b"{}\x00",
+            method="POST",
+            headers={"Content-Type": "application/json", "X-Bridge-Token": "test-token"},
+        )
+        with urlopen(request, timeout=3) as response:
+            assert response.status == 200
+            assert response.read().decode("utf-8") == command_to_tsv(command())
     finally:
         server.shutdown()
         server.server_close()

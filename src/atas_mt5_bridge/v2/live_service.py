@@ -67,7 +67,16 @@ class LiveBridgeController:
             state_store=self.state_store,
         )
         for record in self.coordinator.operation_book.records.values():
-            if record.resolved_at_utc is None and record.status != OperationStatus.FAILED:
+            if record.resolved_at_utc is None:
+                self.gateway.remember_quarantined_command(record.command)
+            # Recovery permits a late EA receipt, but never re-offers an
+            # ambiguous request after a process restart. A timeout is not
+            # proof that MT5 did not receive the original command.
+            if record.resolved_at_utc is None and record.status in {
+                OperationStatus.PENDING,
+                OperationStatus.ACCEPTED,
+                OperationStatus.CONFIRMED,
+            }:
                 self.gateway.restore_unresolved_command(record.command)
             elif record.resolved_at_utc is not None:
                 # A lost HTTP response can make an EA resend an old receipt.
@@ -245,6 +254,9 @@ def _make_handler(controller: LiveBridgeController, token: str):
                 path = self.path.split("?", 1)[0]
                 if path == "/v1/mt5/snapshot":
                     controller.handle_mt5_snapshot(body)
+                elif path == "/v1/mt5/command":
+                    self._respond(200, controller.next_mt5_command(), content_type="text/plain; charset=utf-8")
+                    return
                 elif path == "/v1/mt5/receipt":
                     controller.handle_mt5_receipt(body)
                 elif path == "/v1/operator/confirm-no-effect":

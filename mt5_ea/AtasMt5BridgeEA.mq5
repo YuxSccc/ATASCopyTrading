@@ -206,7 +206,10 @@ void PollAndExecuteOneCommand()
 {
    string response;
    int status = 0;
-   if(!Http("GET", "/v1/mt5/command", "", response, status) || StringLen(response) == 0)
+   // Snapshot and receipt POSTs are already the proven transport path in
+   // MT5. Use the same path for command polling; some terminal builds return
+   // a non-standard status for a non-empty GET response on loopback.
+   if(!Http("POST", "/v1/mt5/command", "{}", response, status) || StringLen(response) == 0)
       return;
    string fields[];
    int count = StringSplit(response, 9, fields);

@@ -40,6 +40,7 @@ class Mt5HttpGateway(TargetExecutionPort):
     _state: TargetAccountState | None = field(default=None, init=False)
     _state_received_at: float = field(default=0.0, init=False)
     _queued_commands: dict[str, BridgeCommand] = field(default_factory=dict, init=False)
+    _quarantined_commands: dict[str, BridgeCommand] = field(default_factory=dict, init=False)
     _acknowledged_receipts: dict[str, ExecutionReceipt] = field(default_factory=dict, init=False)
     _m1_history: tuple[dict[str, object], ...] = field(default=(), init=False)
     _lock: RLock = field(default_factory=RLock, init=False)
@@ -141,15 +142,24 @@ class Mt5HttpGateway(TargetExecutionPort):
             return self._m1_history
 
     def restore_unresolved_command(self, command: BridgeCommand) -> None:
-        """Make a pre-restart request acknowledgeable without re-delivering it.
-
-        The durable operation book is authoritative after a bridge restart.  A
-        recovered command may be acknowledged by an EA that was still running,
-        but must never be blindly sent to the EA a second time.
-        """
+        """Restore only a command whose delivery is still unambiguous."""
 
         with self._lock:
             self._queued_commands.setdefault(command.command_id, command)
+
+    def withdraw_command(self, command_id: str) -> None:
+        """Stop offering an ambiguous command while retaining its receipt key."""
+
+        with self._lock:
+            command = self._queued_commands.pop(command_id, None)
+            if command is not None:
+                self._quarantined_commands.setdefault(command_id, command)
+
+    def remember_quarantined_command(self, command: BridgeCommand) -> None:
+        """Accept a late receipt after restart without re-delivering its action."""
+
+        with self._lock:
+            self._quarantined_commands.setdefault(command.command_id, command)
 
     def restore_acknowledged_receipt(self, receipt: ExecutionReceipt) -> None:
         """Keep a completed command's EA receipt idempotent across restart."""
@@ -172,7 +182,7 @@ class Mt5HttpGateway(TargetExecutionPort):
                 if previous.status != status:
                     raise Mt5GatewayError("EA receipt status conflicts with prior acknowledgement")
                 return previous
-            if command_id not in self._queued_commands:
+            if command_id not in self._queued_commands and command_id not in self._quarantined_commands:
                 raise Mt5GatewayError(f"EA acknowledged unknown command: {command_id}")
             if status in {
                 OperationStatus.ACCEPTED,
@@ -181,6 +191,7 @@ class Mt5HttpGateway(TargetExecutionPort):
                 OperationStatus.UNKNOWN,
             }:
                 self._queued_commands.pop(command_id, None)
+                self._quarantined_commands.pop(command_id, None)
             self._acknowledged_receipts[command_id] = receipt
             return receipt
 
