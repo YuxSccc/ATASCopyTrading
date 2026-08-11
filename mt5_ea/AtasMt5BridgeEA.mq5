@@ -351,7 +351,10 @@ bool Http(string method, string endpoint, string body, string &response, int &st
    char data[];
    char result[];
    string response_headers;
-   StringToCharArray(body, data, 0, WHOLE_ARRAY, CP_UTF8);
+   // StringToCharArray includes a trailing NUL by default. WebRequest sends
+   // the entire array, while JSON permits no trailing NUL byte.
+   int encoded_count = StringToCharArray(body, data, 0, WHOLE_ARRAY, CP_UTF8);
+   ArrayResize(data, encoded_count > 0 ? encoded_count - 1 : 0);
    ResetLastError();
    status = WebRequest(method, BridgeBaseUrl + endpoint, headers, HttpTimeoutMilliseconds, data, result, response_headers);
    if(status == -1)
@@ -360,6 +363,8 @@ bool Http(string method, string endpoint, string body, string &response, int &st
       return false;
    }
    response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
+   if(status < 200 || status >= 300)
+      PrintFormat("ATAS bridge HTTP status=%d endpoint=%s response=%s", status, endpoint, response);
    return status >= 200 && status < 300;
 }
 

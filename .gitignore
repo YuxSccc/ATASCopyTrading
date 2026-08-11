@@ -3,11 +3,13 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 probe-data/
+probe-data-*/
 *.log
 
 # Local runtime configuration
 config.local*.json
 bridge-state/
+bridge-state-*/
 *.compile.log
 *.ex5
 
