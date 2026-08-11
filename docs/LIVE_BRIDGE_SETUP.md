@@ -42,11 +42,11 @@ number, the bridge quarantines the symbol and submits nothing.
    ```
 
 4. Configure the ATAS probe WebSocket as `ws://127.0.0.1:8767`. Add the
-   separate `AtasMt5BasisCollector` strategy to a dedicated **GC M1** chart;
-   keep its source symbol as `GC`, set its chart UTC offset to `480`, and keep
-   the main trading chart on any timeframe you prefer. The collector exports
-   the most recent 240 *closed* M1 bars once per minute and has no trading
-   capability. Confirm that
+   separate `AtasMt5BasisCollector` strategy to the **same GC trading chart**;
+   it may remain on H1 or any other period. Keep its source symbol as `GC` and
+   set its chart UTC offset to `480`. The collector uses ATAS' recent trade
+   cache to aggregate the most recent 240 *closed* M1 prices once per minute;
+   it has no trading capability. Confirm that
    the bridge receives a full ATAS snapshot and the EA posts a complete MT5
    snapshot. The `/v1/status` endpoint (with the token header) must show both
    `source_synchronized=true` and `source_position_complete=true` before
@@ -161,8 +161,9 @@ complex “must always be one-directional” MT5 state machine.
   conservative starting values to tune from logged GC/XAUUSD data, not
   trading recommendations.
 - The estimator uses the latest four-hour M1 window. It is reconstructed from
-  the ATAS GC M1 collector and MT5 `CopyRates(..., PERIOD_M1, 1, 240, ...)`
-  on startup and each minute. Raw bars and basis samples are not persisted.
+  the ATAS GC trade-cache collector (which can run on the H1 trading chart)
+  and MT5 `CopyRates(..., PERIOD_M1, 1, 240, ...)` on startup and each minute.
+  Raw bars and basis samples are not persisted.
 - MT5 volume, tick size, stops level and freeze level are checked before
   pending order creation. The mapped price is rounded only to the target tick.
 - The initial executable mapping covers direct pending-order mirroring,

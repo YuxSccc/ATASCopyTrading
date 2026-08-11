@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using ATAS.Indicators;
@@ -10,15 +11,17 @@ using ATAS.Strategies.Chart;
 namespace AtasMt5ProbeStrategy
 {
     /// <summary>
-    /// Exports closed GC M1 candles for the bridge's in-memory basis
-    /// calibration. Add this strategy to a dedicated M1 chart; the trading
-    /// chart itself may remain on any timeframe. No trading API is used.
+    /// Exports a synthetic closed GC M1 series for in-memory basis
+    /// calibration. It aggregates ATAS' recent trade cache, so it can run on
+    /// the existing trading chart regardless of that chart's candle period.
+    /// No trading API is used.
     /// </summary>
     [Category("Custom")]
     [DisplayName("AtasMt5BasisCollector")]
     public sealed class AtasMt5BasisCollectorStrategy : ChartStrategy
     {
         private ProbeWebSocketClient? _client;
+        private ITradesCache? _trades;
         private string _sessionId = "";
         private long _eventSequence;
         private long _lastExportTicks;
@@ -39,7 +42,7 @@ namespace AtasMt5ProbeStrategy
         public int AtasChartUtcOffsetMinutes { get; set; } = 480;
 
         [OFT.Attributes.ParameterAttribute]
-        [DisplayName("Closed M1 bars to export")]
+        [DisplayName("Closed M1 minutes to export")]
         public int HistoryBars { get; set; } = 240;
 
         [OFT.Attributes.ParameterAttribute]
@@ -53,10 +56,12 @@ namespace AtasMt5ProbeStrategy
             _eventSequence = 0;
             _lastExportTicks = 0;
             _client = new ProbeWebSocketClient(ServerUrl);
+            _trades = GetTradesCache(TimeSpan.FromMinutes(Math.Max(1, HistoryBars)));
             Emit("basis_collector_ready", new
             {
                 chart_type = ChartInfo?.ChartType ?? "",
                 time_frame = ChartInfo?.TimeFrame ?? "",
+                collector_mode = "trades_cache",
                 requested_bars = Math.Max(1, HistoryBars),
                 atas_chart_utc_offset_minutes = AtasChartUtcOffsetMinutes,
             });
@@ -87,27 +92,39 @@ namespace AtasMt5ProbeStrategy
 
         private void EmitHistory()
         {
-            // GetCandle is an ATAS chart-thread API. It must not be called by
-            // the background WebSocket sender.
-            var endExclusive = Math.Max(0, CurrentBar - 1);
-            var start = Math.Max(0, endExclusive - Math.Max(1, HistoryBars));
-            var bars = new List<object>();
-            for (var bar = start; bar < endExclusive; bar++)
+            // CachedItems is obtained and enumerated on ATAS' chart thread.
+            // The cache contains recent raw trades independently of whether
+            // this chart itself is M1, H1, or another candle period.
+            var nowUtcMinute = DateTimeOffset.UtcNow.UtcDateTime
+                .AddSeconds(-DateTimeOffset.UtcNow.UtcDateTime.Second)
+                .AddMilliseconds(-DateTimeOffset.UtcNow.UtcDateTime.Millisecond);
+            var minuteCloses = new SortedDictionary<DateTime, decimal>();
+            var tradeCount = 0;
+            foreach (var trade in _trades?.CachedItems ?? Enumerable.Empty<MarketDataArg>())
             {
-                var candle = GetCandle(bar);
-                var localTime = DateTime.SpecifyKind(candle.Time, DateTimeKind.Unspecified);
+                var localTime = DateTime.SpecifyKind(trade.Time, DateTimeKind.Unspecified);
                 var utcTime = localTime.AddMinutes(-AtasChartUtcOffsetMinutes);
+                var minute = new DateTime(utcTime.Year, utcTime.Month, utcTime.Day, utcTime.Hour, utcTime.Minute, 0, DateTimeKind.Utc);
+                if (minute >= nowUtcMinute)
+                    continue;
+                minuteCloses[minute] = trade.Price;
+                tradeCount++;
+            }
+            var bars = new List<object>();
+            foreach (var item in minuteCloses.TakeLast(Math.Max(1, HistoryBars)))
+            {
                 bars.Add(new
                 {
-                    chart_time = localTime.ToString("O"),
-                    time_utc = new DateTimeOffset(utcTime, TimeSpan.Zero).ToString("O"),
-                    close = candle.Close,
+                    time_utc = new DateTimeOffset(item.Key, TimeSpan.Zero).ToString("O"),
+                    close = item.Value,
                 });
             }
             Emit("basis_history", new
             {
                 chart_type = ChartInfo?.ChartType ?? "",
                 time_frame = ChartInfo?.TimeFrame ?? "",
+                collector_mode = "trades_cache",
+                trade_count = tradeCount,
                 bars,
             });
         }
