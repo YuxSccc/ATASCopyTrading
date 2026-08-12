@@ -4,7 +4,7 @@ import argparse
 import asyncio
 from dataclasses import dataclass, field
 from datetime import timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -256,6 +256,7 @@ class LiveBridgeController:
                 "source_symbol": self.source_symbol,
                 "target_symbol": self.target_symbol,
                 "bridge_magic": self.bridge_magic,
+                "volume_multiplier": str(self.volume_multiplier),
                 "execution_enabled": self.execution_enabled,
                 "source_synchronized": self.coordinator.source_book.has_synchronized_snapshot,
                 "source_position_complete": self.coordinator.source_book.snapshot().position_complete
@@ -658,8 +659,8 @@ def main() -> int:
         "--pair",
         action="append",
         default=[],
-        metavar="TAG=SOURCE:TARGET:MAGIC",
-        help="repeat for one-port multi-pair routing; legacy single-pair flags remain supported",
+        metavar="TAG=SOURCE:TARGET:MAGIC[:MULTIPLIER]",
+        help="repeat for one-port multi-pair routing; multiplier is target volume per source unit",
     )
     parser.add_argument("--state-db", default="bridge-state/bridge.db")
     parser.add_argument("--journal", default="bridge-state/operations.jsonl")
@@ -682,6 +683,8 @@ def main() -> int:
         parser.error("basis window and half-life must be positive")
     if args.basis_minimum_samples <= 0 or args.quote_max_age_ms <= 0 or args.basis_sample_interval_seconds <= 0:
         parser.error("basis sample count, sample interval, and quote maximum age must be positive")
+    if not _valid_multiplier(args.volume_multiplier):
+        parser.error("--volume-multiplier must be a finite positive decimal")
     try:
         pair_specs = _parse_pair_specs(args)
     except ValueError as error:
@@ -709,11 +712,11 @@ def main() -> int:
             pair_tag=tag,
             basis_recording_directory=Path(args.output_dir),
             execution_enabled=args.enable_execution,
-            volume_multiplier=args.volume_multiplier,
+            volume_multiplier=volume_multiplier,
             price_guard_config=price_guard_config,
             test_controller=test_controller,
         )
-        for tag, source_symbol, target_symbol, bridge_magic in pair_specs
+        for tag, source_symbol, target_symbol, bridge_magic, volume_multiplier in pair_specs
     }
     controller: PairRoutedBridgeController | LiveBridgeController
     controller = PairRoutedBridgeController(runtimes, test_controller=test_controller) if len(runtimes) > 1 else next(iter(runtimes.values()))
@@ -743,33 +746,44 @@ def main() -> int:
     return 0
 
 
-def _parse_pair_specs(args: argparse.Namespace) -> list[tuple[str, str, str, int]]:
+def _parse_pair_specs(args: argparse.Namespace) -> list[tuple[str, str, str, int, Decimal]]:
     if args.pair:
         if args.source_symbol or args.bridge_magic is not None:
             raise ValueError("use either --pair or legacy --source-symbol/--bridge-magic, not both")
-        result: list[tuple[str, str, str, int]] = []
+        result: list[tuple[str, str, str, int, Decimal]] = []
         seen: set[str] = set()
         for raw in args.pair:
             if "=" not in raw:
-                raise ValueError(f"invalid --pair {raw!r}; expected TAG=SOURCE:TARGET:MAGIC")
+                raise ValueError(f"invalid --pair {raw!r}; expected TAG=SOURCE:TARGET:MAGIC[:MULTIPLIER]")
             tag, details = raw.split("=", 1)
             parts = details.split(":")
-            if len(parts) != 3 or not all(part.strip() for part in parts):
-                raise ValueError(f"invalid --pair {raw!r}; expected TAG=SOURCE:TARGET:MAGIC")
-            source, target, magic_text = (part.strip() for part in parts)
+            if len(parts) not in {3, 4} or not all(part.strip() for part in parts):
+                raise ValueError(f"invalid --pair {raw!r}; expected TAG=SOURCE:TARGET:MAGIC[:MULTIPLIER]")
+            source, target, magic_text = (part.strip() for part in parts[:3])
+            multiplier_text = parts[3].strip() if len(parts) == 4 else str(args.volume_multiplier)
             try:
                 magic = int(magic_text)
             except ValueError as error:
                 raise ValueError(f"invalid bridge magic in --pair {raw!r}") from error
+            try:
+                multiplier = Decimal(multiplier_text)
+            except (InvalidOperation, ValueError) as error:
+                raise ValueError(f"invalid volume multiplier in --pair {raw!r}") from error
+            if not _valid_multiplier(multiplier):
+                raise ValueError(f"volume multiplier must be finite and positive in --pair {raw!r}")
             key = _pair_key(tag)
             if not key or key in seen:
                 raise ValueError(f"duplicate/empty pair tag in --pair {raw!r}")
             seen.add(key)
-            result.append((tag.strip(), source, target, magic))
+            result.append((tag.strip(), source, target, magic, multiplier))
         return result
     if not args.source_symbol or args.bridge_magic is None:
         raise ValueError("--source-symbol and --bridge-magic are required when --pair is not used")
-    return [("", args.source_symbol, args.target_symbol, args.bridge_magic)]
+    return [("", args.source_symbol, args.target_symbol, args.bridge_magic, args.volume_multiplier)]
+
+
+def _valid_multiplier(value: Decimal) -> bool:
+    return value.is_finite() and value > 0
 
 
 if __name__ == "__main__":

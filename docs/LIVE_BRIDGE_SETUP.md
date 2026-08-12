@@ -36,14 +36,14 @@ number, the bridge quarantines the symbol and submits nothing.
    field is optional during migration; the service has a unique-symbol/magic
    fallback. Use distinct magic numbers when possible.
 3. Start one service for all pairs. Each `--pair` is
-   `TAG=ATAS_SOURCE:MT5_TARGET:MAGIC`:
+   `TAG=ATAS_SOURCE:MT5_TARGET:MAGIC:MULTIPLIER`, where `MULTIPLIER` is
+   target lots per one ATAS lot:
 
    ```powershell
    $env:PYTHONPATH = "src"
    python -m atas_mt5_bridge.v2.live_service `
-     --pair gc_xauusd=GC:XAUUSD:26081001 `
-     --pair nq_ustec=USTEC:USTEC:26081002 `
-     --volume-multiplier 1
+     --pair gc_xauusd=GC:XAUUSD:26081001:0.05 `
+     --pair nq_ustec=NQ:USTEC:26081001:0.5
    ```
 
    For the first observation run, omit `--enable-execution` and keep the EA

@@ -12,9 +12,23 @@ from atas_mt5_bridge.v2.models import BridgeCommand, CommandType, OperationStatu
 from atas_mt5_bridge.v2.live_service import (
     LiveBridgeController,
     PairRoutedBridgeController,
+    _parse_pair_specs,
     _merge_minute_bars,
     start_mt5_http_server,
 )
+
+
+def test_pair_spec_parses_individual_volume_multipliers():
+    args = type("Args", (), {
+        "pair": ["gc_xauusd=GC:XAUUSD:26081001:0.05", "nq_ustec=NQ:USTEC:26081001:0.5"],
+        "source_symbol": None,
+        "bridge_magic": None,
+        "target_symbol": "XAUUSD",
+        "volume_multiplier": Decimal("1"),
+    })()
+    specs = _parse_pair_specs(args)
+    assert specs[0][-1] == Decimal("0.05")
+    assert specs[1][-1] == Decimal("0.5")
 from atas_mt5_bridge.v2.test_control import DemoTestController
 from atas_mt5_bridge.v2.mt5_gateway import Mt5GatewayError, Mt5HttpGateway, command_to_tsv
 
