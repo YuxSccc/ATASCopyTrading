@@ -43,6 +43,8 @@ class Mt5HttpGateway(TargetExecutionPort):
     _quarantined_commands: dict[str, BridgeCommand] = field(default_factory=dict, init=False)
     _acknowledged_receipts: dict[str, ExecutionReceipt] = field(default_factory=dict, init=False)
     _m1_history: tuple[dict[str, object], ...] = field(default=(), init=False)
+    _transport_times: dict[str, dict[str, float | str | int]] = field(default_factory=dict, init=False)
+    _last_transport: dict[str, object] | None = field(default=None, init=False)
     _lock: RLock = field(default_factory=RLock, init=False)
 
     def read_state(self, target_symbol: str) -> TargetAccountState:
@@ -64,6 +66,9 @@ class Mt5HttpGateway(TargetExecutionPort):
             if monotonic() - self._state_received_at > self.snapshot_ttl_seconds:
                 return ExecutionReceipt(command.command_id, OperationStatus.UNKNOWN, message="MT5 snapshot is stale")
             self._queued_commands.setdefault(command.command_id, command)
+            timing = self._transport_times.setdefault(command.command_id, {})
+            timing.setdefault("queued_monotonic", monotonic())
+            timing.setdefault("queued_at_utc", datetime.now(timezone.utc).isoformat())
             return ExecutionReceipt(command.command_id, OperationStatus.PENDING, message="queued for MT5 EA")
 
     def ingest_snapshot(self, payload: Mapping[str, Any]) -> TargetAccountState:
@@ -112,7 +117,30 @@ class Mt5HttpGateway(TargetExecutionPort):
         with self._lock:
             if self._state is None or monotonic() - self._state_received_at > self.snapshot_ttl_seconds:
                 return ()
-            return tuple(list(self._queued_commands.values())[:limit])
+            commands = tuple(list(self._queued_commands.values())[:limit])
+            offered_monotonic = monotonic()
+            offered_at_utc = datetime.now(timezone.utc).isoformat()
+            for command in commands:
+                timing = self._transport_times.setdefault(command.command_id, {})
+                timing.setdefault("offered_monotonic", offered_monotonic)
+                timing.setdefault("offered_at_utc", offered_at_utc)
+                timing["offer_count"] = int(timing.get("offer_count", 0)) + 1
+            return commands
+
+    def transport_status(self) -> dict[str, object]:
+        """Return the latest local queue/EA receipt timing for diagnostics.
+
+        These measurements stop at the EA's HTTP receipt. They intentionally
+        do not claim that a broker-side order or position is already visible;
+        that separate confirmation interval is represented by the operation
+        record's dispatched/resolved timestamps.
+        """
+
+        with self._lock:
+            return dict(self._last_transport) if self._last_transport is not None else {
+                "available": False,
+                "queued_commands": len(self._queued_commands),
+            }
 
     def snapshot_status(self) -> dict[str, bool | int | None]:
         """Expose only snapshot liveness for the local operator status page."""
@@ -193,6 +221,24 @@ class Mt5HttpGateway(TargetExecutionPort):
                 self._queued_commands.pop(command_id, None)
                 self._quarantined_commands.pop(command_id, None)
             self._acknowledged_receipts[command_id] = receipt
+            timing = self._transport_times.get(command_id)
+            if timing is not None:
+                received_monotonic = monotonic()
+                offered_monotonic = timing.get("offered_monotonic")
+                queued_monotonic = timing.get("queued_monotonic")
+                self._last_transport = {
+                    "available": True,
+                    "command_id": command_id,
+                    "status": status.value,
+                    "queued_at_utc": timing.get("queued_at_utc"),
+                    "offered_at_utc": timing.get("offered_at_utc"),
+                    "receipt_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "offer_count": int(timing.get("offer_count", 0)),
+                    "queued_to_offer_ms": _elapsed_ms(queued_monotonic, offered_monotonic),
+                    "offer_to_receipt_ms": _elapsed_ms(offered_monotonic, received_monotonic),
+                    "queued_to_receipt_ms": _elapsed_ms(queued_monotonic, received_monotonic),
+                }
+                self._transport_times.pop(command_id, None)
             return receipt
 
 
@@ -335,3 +381,9 @@ def _text(data: Mapping[str, Any], key: str) -> str:
 def _optional_text(value: object) -> str | None:
     value = str(value).strip() if value is not None else ""
     return value or None
+
+
+def _elapsed_ms(start: object, end: object) -> float | None:
+    if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+        return None
+    return round(max(0.0, float(end) - float(start)) * 1000.0, 3)

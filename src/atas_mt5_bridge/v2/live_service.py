@@ -245,6 +245,10 @@ class LiveBridgeController:
                     "source_m1_bars": len(self._source_m1_history),
                     "target_m1_bars": len(self.gateway.latest_m1_history()),
                 },
+                "latency": {
+                    "mt5_local_transport": self.gateway.transport_status(),
+                    "note": "transport ends at EA receipt; operation confirmation is target-snapshot based",
+                },
             }
 
     def next_mt5_command(self) -> str:

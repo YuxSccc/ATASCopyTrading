@@ -92,6 +92,14 @@ def test_gateway_parses_bridge_filtered_snapshot_queues_once_and_accepts_ea_rece
     receipt = gateway.acknowledge_command({"command_id": "command-1", "status": "accepted", "target_reference": "17"})
     assert receipt.status == OperationStatus.ACCEPTED
 
+    timing = gateway.transport_status()
+    assert timing["available"] is True
+    assert timing["command_id"] == "command-1"
+    assert timing["status"] == "accepted"
+    assert isinstance(timing["queued_to_offer_ms"], float)
+    assert isinstance(timing["offer_to_receipt_ms"], float)
+    assert isinstance(timing["queued_to_receipt_ms"], float)
+
 
 def test_gateway_retains_only_the_latest_in_memory_m1_window():
     gateway = Mt5HttpGateway("XAUUSD", 26081001)
