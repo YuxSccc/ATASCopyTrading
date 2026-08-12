@@ -1,19 +1,22 @@
 #property strict
-#property version   "0.101"
+#property version   "0.102"
 #property description "Local ATAS-to-MT5 bridge observer and guarded command executor."
 
 input string BridgeBaseUrl = "http://127.0.0.1:8768";
 input long BridgeMagic = 26081001;
 input bool EnableExecution = false;
-// One snapshot now also returns the next command.  Keeping the interval at
-// 50 ms bounds the loopback poll delay without making two HTTP requests per
-// timer tick.
+// The fast path is a quote/command heartbeat.  Complete account snapshots
+// are pushed on trade transactions and periodically for recovery, rather
+// than being rebuilt on every poll tick.
 input int SnapshotIntervalMilliseconds = 50;
+input int FullSnapshotIntervalMilliseconds = 5000;
 input int HttpTimeoutMilliseconds = 1000;
 
 ulong g_last_snapshot_tick = 0;
+ulong g_last_full_snapshot_tick = 0;
 ulong g_last_m1_history_tick = 0;
 bool g_m1_history_dirty = false;
+bool g_full_snapshot_due = true;
 string g_m1_bars_json = "";
 int g_m1_server_utc_offset_seconds = 0;
 string g_pending_receipt_body = "";
@@ -33,7 +36,7 @@ int OnInit()
    else
       Print("ATAS bridge health check succeeded");
    string startup_command;
-   if(PublishSnapshot(startup_command) && EnableExecution && StringLen(startup_command) > 0)
+   if(PublishFullSnapshot(startup_command) && EnableExecution && StringLen(startup_command) > 0)
       ExecuteCommandWire(startup_command);
    return(INIT_SUCCEEDED);
 }
@@ -52,15 +55,18 @@ void OnTimer()
       return;
    ulong now = GetTickCount();
    RefreshM1History(false);
-   bool snapshot_posted = false;
-   string snapshot_command = "";
+   bool heartbeat_posted = false;
+   string heartbeat_command = "";
    if(now - g_last_snapshot_tick >= (ulong)MathMax(10, SnapshotIntervalMilliseconds))
-      snapshot_posted = PublishSnapshot(snapshot_command);
-   // The bridge selects a command while processing this exact snapshot and
-   // returns it in-band.  This removes a second synchronous WebRequest from
-   // every poll cycle while preserving the snapshot-before-command guard.
-   if(EnableExecution && snapshot_posted && StringLen(snapshot_command) > 0)
-      ExecuteCommandWire(snapshot_command);
+      heartbeat_posted = g_full_snapshot_due
+                         || now - g_last_full_snapshot_tick >= (ulong)MathMax(100, FullSnapshotIntervalMilliseconds)
+                         ? PublishFullSnapshot(heartbeat_command)
+                         : PublishHeartbeat(heartbeat_command);
+   // The bridge selects a command while processing this exact heartbeat or
+   // full snapshot and returns it in-band.  Trade callbacks force the next
+   // timer tick onto the full path so command effects are observed promptly.
+   if(EnableExecution && heartbeat_posted && StringLen(heartbeat_command) > 0)
+      ExecuteCommandWire(heartbeat_command);
 }
 
 void OnTradeTransaction(const MqlTradeTransaction &transaction,
@@ -70,10 +76,11 @@ void OnTradeTransaction(const MqlTradeTransaction &transaction,
    // Trading handlers must remain fast. The next timer tick publishes a full
    // bridge-filtered snapshot; snapshots, rather than callback ordering, are
    // the authority used by the local coordinator.
+   g_full_snapshot_due = true;
    g_last_snapshot_tick = 0;
 }
 
-bool PublishSnapshot(string &command_response)
+bool PublishFullSnapshot(string &command_response)
 {
    command_response = "";
    bool include_history = g_m1_history_dirty;
@@ -88,9 +95,32 @@ bool PublishSnapshot(string &command_response)
    if(include_history)
       g_m1_history_dirty = false;
    g_last_snapshot_tick = GetTickCount();
+   g_last_full_snapshot_tick = g_last_snapshot_tick;
+   g_full_snapshot_due = false;
    // An old service returns JSON {"ok":true}.  It is valid for observation
    // mode but is not a command wire payload, so silently ignore it while an
    // upgraded service is being restarted.
+   if(StringLen(response) > 0 && StringGetCharacter(response, 0) != '{')
+      command_response = response;
+   return true;
+}
+
+bool PublishHeartbeat(string &command_response)
+{
+   command_response = "";
+   MqlTick tick = {};
+   SymbolInfoTick(_Symbol, tick);
+   string body = StringFormat(
+      "{\"target_symbol\":\"%s\",\"bridge_magic\":%I64d,\"quote\":{\"bid\":\"%s\",\"ask\":\"%s\",\"occurred_at_utc\":\"%s\"}}",
+      EscapeJson(_Symbol), BridgeMagic, Number(tick.bid), Number(tick.ask), UtcIso(TimeGMT()));
+   string response;
+   int status = 0;
+   if(!Http("POST", "/v1/mt5/heartbeat?poll=1", body, response, status))
+   {
+      PrintFormat("ATAS bridge heartbeat POST failed, HTTP=%d", status);
+      return false;
+   }
+   g_last_snapshot_tick = GetTickCount();
    if(StringLen(response) > 0 && StringGetCharacter(response, 0) != '{')
       command_response = response;
    return true;
@@ -190,7 +220,10 @@ void RefreshM1History(bool force)
    g_last_m1_history_tick = now;
    MqlRates rates[];
    int copied = CopyRates(_Symbol, PERIOD_M1, 1, 240, rates);
-   if(copied < 180)
+   // The bridge's configured minimum is 170 matching closed M1 samples.  A
+   // normal GC maintenance halt can leave roughly 175 bars in the latest
+   // four-hour window, which is still sufficient for calibration.
+   if(copied < 170)
    {
       PrintFormat("ATAS bridge M1 history unavailable or incomplete: copied=%d", copied);
       return;

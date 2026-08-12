@@ -137,6 +137,58 @@ def test_gateway_rejects_a_stale_complete_snapshot_before_command_queueing():
     assert gateway.next_commands() == ()
 
 
+def test_gateway_heartbeat_updates_quote_without_replacing_account_state():
+    gateway = Mt5HttpGateway("XAUUSD", 26081001)
+    gateway.ingest_snapshot(snapshot())
+    heartbeat = {
+        "target_symbol": "XAUUSD",
+        "bridge_magic": 26081001,
+        "quote": {"bid": "4001.0", "ask": "4001.2"},
+    }
+
+    state = gateway.ingest_heartbeat(heartbeat)
+
+    assert state.quote is not None
+    assert state.quote.bid == Decimal("4001.0")
+    assert state.positions[0].ticket == "9"
+    assert state.pending_orders[0].ticket == "17"
+    status = gateway.snapshot_status()
+    assert status["heartbeat_received"] is True
+    assert status["transport_alive"] is True
+
+
+def test_gateway_accepts_heartbeat_before_first_complete_snapshot():
+    gateway = Mt5HttpGateway("XAUUSD", 26081001)
+
+    assert gateway.ingest_heartbeat(
+        {
+            "target_symbol": "XAUUSD",
+            "bridge_magic": 26081001,
+            "quote": {"bid": "4001.0", "ask": "4001.2"},
+        }
+    ) is None
+    assert gateway.next_commands() == ()
+    assert gateway.snapshot_status()["heartbeat_received"] is True
+
+
+def test_gateway_stops_offering_when_heartbeat_stops_after_one_was_seen():
+    gateway = Mt5HttpGateway("XAUUSD", 26081001, snapshot_ttl_seconds=10, heartbeat_ttl_seconds=0.001)
+    gateway.ingest_snapshot(snapshot())
+    gateway.ingest_heartbeat(
+        {
+            "target_symbol": "XAUUSD",
+            "bridge_magic": 26081001,
+            "quote": {"bid": "4001.0", "ask": "4001.2"},
+        }
+    )
+    gateway.execute(command())
+    gateway._last_heartbeat_at -= 1
+
+    assert gateway.next_commands() == ()
+    assert gateway.snapshot_status()["fresh"] is True
+    assert gateway.snapshot_status()["transport_alive"] is False
+
+
 def test_gateway_receipt_is_idempotent_and_a_recovered_command_is_not_redelivered():
     gateway = Mt5HttpGateway("XAUUSD", 26081001)
     gateway.ingest_snapshot(snapshot())
@@ -378,6 +430,43 @@ def test_mt5_snapshot_poll_returns_command_in_the_same_http_response(tmp_path: P
             assert response.status == 200
             assert response.headers["Content-Type"].startswith("text/plain")
             assert response.read().decode("utf-8") == command_to_tsv(command())
+    finally:
+        server.shutdown()
+        server.server_close()
+        controller.close()
+
+
+def test_mt5_heartbeat_poll_returns_command_without_replacing_full_snapshot(tmp_path: Path):
+    controller = LiveBridgeController(
+        source_symbol="GC",
+        target_symbol="XAUUSD",
+        bridge_magic=26081001,
+        database_path=tmp_path / "bridge.db",
+        journal_path=tmp_path / "operations.jsonl",
+    )
+    server = start_mt5_http_server(controller, "127.0.0.1", 0)
+    try:
+        controller.gateway.ingest_snapshot(snapshot())
+        controller.gateway.execute(command())
+        heartbeat = {
+            "target_symbol": "XAUUSD",
+            "bridge_magic": 26081001,
+            "quote": {"bid": "4001.0", "ask": "4001.2"},
+        }
+        request = Request(
+            f"http://127.0.0.1:{server.server_port}/v1/mt5/heartbeat?poll=1",
+            data=(json.dumps(heartbeat).encode("utf-8") + b"\x00"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urlopen(request, timeout=3) as response:
+            assert response.status == 200
+            assert response.read().decode("utf-8") == command_to_tsv(command())
+        state = controller.gateway.latest_state()
+        assert state is not None
+        assert state.quote is not None
+        assert state.quote.bid == Decimal("4001.0")
+        assert state.positions[0].ticket == "9"
     finally:
         server.shutdown()
         server.server_close()

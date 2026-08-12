@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from threading import RLock
@@ -36,9 +36,18 @@ class Mt5HttpGateway(TargetExecutionPort):
 
     target_symbol: str
     bridge_magic: int
-    snapshot_ttl_seconds: float = 1.0
+    # Full account state is now pushed on trade transactions and at a slow
+    # recovery interval.  Heartbeats carry only the quote, so the full state
+    # must remain valid for slightly longer than that recovery interval.
+    snapshot_ttl_seconds: float = 6.0
+    # A heartbeat proves that the EA/terminal loop is still reachable, but it
+    # deliberately carries no positions or orders.  Once a heartbeat has
+    # been seen, command delivery also requires a recent heartbeat; the full
+    # snapshot remains the authority for execution confirmation.
+    heartbeat_ttl_seconds: float = 0.5
     _state: TargetAccountState | None = field(default=None, init=False)
     _state_received_at: float = field(default=0.0, init=False)
+    _last_heartbeat_at: float = field(default=0.0, init=False)
     _queued_commands: dict[str, BridgeCommand] = field(default_factory=dict, init=False)
     _quarantined_commands: dict[str, BridgeCommand] = field(default_factory=dict, init=False)
     _acknowledged_receipts: dict[str, ExecutionReceipt] = field(default_factory=dict, init=False)
@@ -53,7 +62,7 @@ class Mt5HttpGateway(TargetExecutionPort):
                 raise Mt5GatewayError(f"unexpected target symbol: {target_symbol}")
             if self._state is None:
                 raise Mt5GatewayError("no complete MT5 snapshot received")
-            if monotonic() - self._state_received_at > self.snapshot_ttl_seconds:
+            if not self._transport_is_fresh_locked():
                 raise Mt5GatewayError("latest MT5 snapshot is stale")
             return self._state
 
@@ -63,7 +72,7 @@ class Mt5HttpGateway(TargetExecutionPort):
                 return ExecutionReceipt(command.command_id, OperationStatus.FAILED, message="wrong target symbol")
             if self._state is None:
                 return ExecutionReceipt(command.command_id, OperationStatus.UNKNOWN, message="MT5 snapshot unavailable")
-            if monotonic() - self._state_received_at > self.snapshot_ttl_seconds:
+            if not self._transport_is_fresh_locked():
                 return ExecutionReceipt(command.command_id, OperationStatus.UNKNOWN, message="MT5 snapshot is stale")
             self._queued_commands.setdefault(command.command_id, command)
             timing = self._transport_times.setdefault(command.command_id, {})
@@ -105,6 +114,35 @@ class Mt5HttpGateway(TargetExecutionPort):
                 self._m1_history = history
         return state
 
+    def ingest_heartbeat(self, payload: Mapping[str, Any]) -> TargetAccountState | None:
+        """Update only the fast quote path without replacing account state.
+
+        Positions and pending orders are authoritative only in a complete
+        snapshot.  Keeping them untouched here prevents a quote heartbeat
+        from being mistaken for proof that an asynchronous MT5 operation has
+        completed.
+        """
+
+        target_symbol = _text(payload, "target_symbol")
+        if target_symbol != self.target_symbol:
+            raise Mt5GatewayError(f"heartbeat symbol {target_symbol} does not match {self.target_symbol}")
+        if int(payload.get("bridge_magic", -1)) != self.bridge_magic:
+            raise Mt5GatewayError("heartbeat bridge magic does not match")
+        quote = _parse_quote(payload.get("quote"), target_symbol, datetime.now(timezone.utc).isoformat())
+        if quote is None or not quote.is_complete:
+            raise Mt5GatewayError("heartbeat quote is incomplete")
+        with self._lock:
+            if self._state is None:
+                # A service restart can occur while the EA is already
+                # running.  Accepting the liveness/quote message here avoids
+                # a burst of 400 responses until the next recovery snapshot;
+                # no command can be offered because _state is still absent.
+                self._last_heartbeat_at = monotonic()
+                return None
+            self._state = replace(self._state, quote=quote)
+            self._last_heartbeat_at = monotonic()
+            return self._state
+
     def next_commands(self, limit: int = 1) -> tuple[BridgeCommand, ...]:
         """Offer each queued command until the EA durably acknowledges it.
 
@@ -115,7 +153,7 @@ class Mt5HttpGateway(TargetExecutionPort):
         """
 
         with self._lock:
-            if self._state is None or monotonic() - self._state_received_at > self.snapshot_ttl_seconds:
+            if not self._transport_is_fresh_locked():
                 return ()
             commands = tuple(list(self._queued_commands.values())[:limit])
             offered_monotonic = monotonic()
@@ -147,13 +185,47 @@ class Mt5HttpGateway(TargetExecutionPort):
 
         with self._lock:
             if self._state is None:
-                return {"received": False, "fresh": False, "age_ms": None}
+                heartbeat_age_seconds = (
+                    max(0.0, monotonic() - self._last_heartbeat_at) if self._last_heartbeat_at else None
+                )
+                return {
+                    "received": False,
+                    "fresh": False,
+                    "age_ms": None,
+                    "heartbeat_received": self._last_heartbeat_at > 0,
+                    "heartbeat_age_ms": round(heartbeat_age_seconds * 1000) if heartbeat_age_seconds is not None else None,
+                    "transport_alive": False,
+                }
             age_seconds = max(0.0, monotonic() - self._state_received_at)
+            heartbeat_age_seconds = (
+                max(0.0, monotonic() - self._last_heartbeat_at) if self._last_heartbeat_at else None
+            )
             return {
                 "received": True,
                 "fresh": age_seconds <= self.snapshot_ttl_seconds,
                 "age_ms": round(age_seconds * 1000),
+                "heartbeat_received": self._last_heartbeat_at > 0,
+                "heartbeat_age_ms": round(heartbeat_age_seconds * 1000) if heartbeat_age_seconds is not None else None,
+                "transport_alive": self._transport_is_fresh_locked(),
             }
+
+    def _transport_is_fresh_locked(self) -> bool:
+        """Return whether it is safe to read/offer through the EA boundary.
+
+        Complete account state is intentionally allowed to live for the
+        five-second recovery interval plus a small scheduling margin.  A
+        heartbeat, when available, supplies the fast liveness check without
+        pretending to be account-state confirmation.  Older EAs that never
+        send heartbeats continue to work with complete snapshots alone.
+        """
+
+        if self._state is None:
+            return False
+        if monotonic() - self._state_received_at > self.snapshot_ttl_seconds:
+            return False
+        if self._last_heartbeat_at and monotonic() - self._last_heartbeat_at > self.heartbeat_ttl_seconds:
+            return False
+        return True
 
     def latest_state(self) -> TargetAccountState | None:
         """Return the most recent complete snapshot for diagnostics only.

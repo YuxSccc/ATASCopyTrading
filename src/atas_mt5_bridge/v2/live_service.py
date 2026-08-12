@@ -141,6 +141,37 @@ class LiveBridgeController:
             self.coordinator.handle_target_observation()
             return self._next_mt5_command_locked()
 
+    def handle_mt5_heartbeat(self, payload: Mapping[str, Any]) -> None:
+        """Ingest only the fast MT5 quote/liveness message.
+
+        A heartbeat must not be treated as a position/order observation.  In
+        particular, it cannot confirm a create or cancel operation and it
+        must not cause the full reconciliation planner to run on every
+        50-millisecond timer tick.  It may still feed the in-memory basis
+        estimator so a source order arriving between complete snapshots uses
+        the latest target quote.
+        """
+
+        with self._lock:
+            target = self.gateway.ingest_heartbeat(payload)
+            if target is not None and self.coordinator.source_book.has_synchronized_snapshot:
+                source = self.coordinator.source_book.snapshot()
+                observer = getattr(self.coordinator.policy, "observe_market_data", None)
+                if callable(observer):
+                    observer(source, target)
+
+    def handle_mt5_heartbeat_and_next_command(self, payload: Mapping[str, Any]) -> str:
+        """Update quote/liveness and return one queued command in-band."""
+
+        with self._lock:
+            target = self.gateway.ingest_heartbeat(payload)
+            if target is not None and self.coordinator.source_book.has_synchronized_snapshot:
+                source = self.coordinator.source_book.snapshot()
+                observer = getattr(self.coordinator.policy, "observe_market_data", None)
+                if callable(observer):
+                    observer(source, target)
+            return self._next_mt5_command_locked()
+
     def _handle_basis_collector_message(self, payload: Mapping[str, Any]) -> None:
         if str(payload.get("event_type", "")) != "basis_history":
             return
@@ -228,6 +259,9 @@ class LiveBridgeController:
                 "target_snapshot_received": target_snapshot["received"],
                 "target_snapshot_fresh": target_snapshot["fresh"],
                 "target_snapshot_age_ms": target_snapshot["age_ms"],
+                "target_heartbeat_received": target_snapshot["heartbeat_received"],
+                "target_heartbeat_age_ms": target_snapshot["heartbeat_age_ms"],
+                "target_transport_alive": target_snapshot["transport_alive"],
                 "reconciliation_required": self.coordinator.reconciliation_required,
                 "in_flight_operations": sum(record.resolved_at_utc is None for record in operations),
                 "unknown_or_failed_operations": sum(
@@ -348,6 +382,15 @@ def _make_handler(controller: LiveBridgeController):
                         self._respond(200, command, content_type="text/plain; charset=utf-8")
                         return
                     controller.handle_mt5_snapshot(body)
+                elif path == "/v1/mt5/heartbeat":
+                    # Heartbeats carry only quote/liveness.  They never
+                    # replace the complete state used for confirmation.
+                    query = self.path.split("?", 1)[1] if "?" in self.path else ""
+                    if "poll=1" in query.split("&"):
+                        command = controller.handle_mt5_heartbeat_and_next_command(body)
+                        self._respond(200, command, content_type="text/plain; charset=utf-8")
+                        return
+                    controller.handle_mt5_heartbeat(body)
                 elif path == "/v1/mt5/command":
                     self._respond(200, controller.next_mt5_command(), content_type="text/plain; charset=utf-8")
                     return
