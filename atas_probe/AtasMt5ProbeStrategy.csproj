@@ -14,8 +14,8 @@
 
   <ItemGroup>
     <!-- Basis history is embedded in AtasBridgeProbeStrategy. Keep the old
-         standalone source only as a compatibility reference; it is not
-         exposed as a second production strategy. -->
+         standalone implementation only as a source reference; the small
+         compatibility type keeps previously saved ATAS workspaces loadable. -->
     <Compile Remove="AtasMt5BasisCollectorStrategy.cs" />
   </ItemGroup>
 
