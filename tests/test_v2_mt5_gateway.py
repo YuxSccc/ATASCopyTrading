@@ -347,6 +347,35 @@ def test_mt5_http_server_offers_commands_over_post_for_mql_compatibility(tmp_pat
         controller.close()
 
 
+def test_mt5_snapshot_poll_returns_command_in_the_same_http_response(tmp_path: Path):
+    controller = LiveBridgeController(
+        source_symbol="GC",
+        target_symbol="XAUUSD",
+        bridge_magic=26081001,
+        database_path=tmp_path / "bridge.db",
+        journal_path=tmp_path / "operations.jsonl",
+    )
+    server = start_mt5_http_server(controller, "127.0.0.1", 0)
+    try:
+        controller.gateway.ingest_snapshot(snapshot())
+        controller.gateway.execute(command())
+        payload = json.dumps(snapshot()).encode("utf-8") + b"\x00"
+        request = Request(
+            f"http://127.0.0.1:{server.server_port}/v1/mt5/snapshot?poll=1",
+            data=payload,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urlopen(request, timeout=3) as response:
+            assert response.status == 200
+            assert response.headers["Content-Type"].startswith("text/plain")
+            assert response.read().decode("utf-8") == command_to_tsv(command())
+    finally:
+        server.shutdown()
+        server.server_close()
+        controller.close()
+
+
 def test_source_history_merge_keeps_prior_closed_minutes_when_collector_restarts():
     existing = (
         {"time_utc": "2026-08-11T22:00:00+00:00", "close": "4420.0"},

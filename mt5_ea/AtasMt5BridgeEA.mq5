@@ -1,11 +1,14 @@
 #property strict
-#property version   "0.100"
+#property version   "0.101"
 #property description "Local ATAS-to-MT5 bridge observer and guarded command executor."
 
 input string BridgeBaseUrl = "http://127.0.0.1:8768";
 input long BridgeMagic = 26081001;
 input bool EnableExecution = false;
-input int SnapshotIntervalMilliseconds = 100;
+// One snapshot now also returns the next command.  Keeping the interval at
+// 50 ms bounds the loopback poll delay without making two HTTP requests per
+// timer tick.
+input int SnapshotIntervalMilliseconds = 50;
 input int HttpTimeoutMilliseconds = 1000;
 
 ulong g_last_snapshot_tick = 0;
@@ -29,7 +32,9 @@ int OnInit()
       PrintFormat("ATAS bridge health check failed, HTTP=%d", health_status);
    else
       Print("ATAS bridge health check succeeded");
-   PublishSnapshot();
+   string startup_command;
+   if(PublishSnapshot(startup_command) && EnableExecution && StringLen(startup_command) > 0)
+      ExecuteCommandWire(startup_command);
    return(INIT_SUCCEEDED);
 }
 
@@ -48,13 +53,14 @@ void OnTimer()
    ulong now = GetTickCount();
    RefreshM1History(false);
    bool snapshot_posted = false;
+   string snapshot_command = "";
    if(now - g_last_snapshot_tick >= (ulong)MathMax(10, SnapshotIntervalMilliseconds))
-      snapshot_posted = PublishSnapshot();
-   // A command is only valid against the account snapshot that this EA has
-   // just succeeded in giving to the local bridge. Never execute from a
-   // terminal that lost its bridge heartbeat.
-   if(EnableExecution && snapshot_posted)
-      PollAndExecuteOneCommand();
+      snapshot_posted = PublishSnapshot(snapshot_command);
+   // The bridge selects a command while processing this exact snapshot and
+   // returns it in-band.  This removes a second synchronous WebRequest from
+   // every poll cycle while preserving the snapshot-before-command guard.
+   if(EnableExecution && snapshot_posted && StringLen(snapshot_command) > 0)
+      ExecuteCommandWire(snapshot_command);
 }
 
 void OnTradeTransaction(const MqlTradeTransaction &transaction,
@@ -67,13 +73,14 @@ void OnTradeTransaction(const MqlTradeTransaction &transaction,
    g_last_snapshot_tick = 0;
 }
 
-bool PublishSnapshot()
+bool PublishSnapshot(string &command_response)
 {
+   command_response = "";
    bool include_history = g_m1_history_dirty;
    string body = BuildSnapshotJson(include_history);
    string response;
    int status = 0;
-   if(!Http("POST", "/v1/mt5/snapshot", body, response, status))
+   if(!Http("POST", "/v1/mt5/snapshot?poll=1", body, response, status))
    {
       PrintFormat("ATAS bridge snapshot POST failed, HTTP=%d", status);
       return false;
@@ -81,6 +88,11 @@ bool PublishSnapshot()
    if(include_history)
       g_m1_history_dirty = false;
    g_last_snapshot_tick = GetTickCount();
+   // An old service returns JSON {"ok":true}.  It is valid for observation
+   // mode but is not a command wire payload, so silently ignore it while an
+   // upgraded service is being restarted.
+   if(StringLen(response) > 0 && StringGetCharacter(response, 0) != '{')
+      command_response = response;
    return true;
 }
 
@@ -205,6 +217,11 @@ void PollAndExecuteOneCommand()
    // a non-standard status for a non-empty GET response on loopback.
    if(!Http("POST", "/v1/mt5/command", "{}", response, status) || StringLen(response) == 0)
       return;
+   ExecuteCommandWire(response);
+}
+
+void ExecuteCommandWire(string response)
+{
    string fields[];
    int count = StringSplit(response, 9, fields);
    if(count != 11)

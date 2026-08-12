@@ -149,7 +149,11 @@ complex “must always be one-directional” MT5 state machine.
 
 ## Current safeguards and limits
 
-- 100 ms EA poll/snapshot interval is configurable; no bridge-side debounce.
+- The EA uses one combined snapshot-and-command HTTP request at a default
+  50 ms interval.  The legacy `/v1/mt5/command` endpoint remains available
+  for older EAs, but the combined path removes one synchronous MQL5
+  `WebRequest` from every poll cycle.  The interval is configurable; there is
+  no bridge-side debounce.
 - ATAS events use serialized transport with acknowledgement/retry. During a
   disconnect only quote events are capped (20 by default); order/position
   events and periodic authoritative snapshots remain queued. MT5 and ATAS

@@ -124,6 +124,23 @@ class LiveBridgeController:
             self._refresh_history_calibration()
             self.coordinator.handle_target_observation()
 
+    def handle_mt5_snapshot_and_next_command(self, payload: Mapping[str, Any]) -> str:
+        """Ingest one complete snapshot and return the next command in-band.
+
+        The EA used to POST a snapshot and then make a second HTTP request to
+        poll for a command.  Both requests are loopback calls, but MQL5's
+        ``WebRequest`` is synchronous, so the second round trip directly adds
+        to the observable order latency.  Keeping the operation under the
+        same controller lock also means the command is selected from the
+        snapshot that just reached the bridge.
+        """
+
+        with self._lock:
+            self.gateway.ingest_snapshot(payload)
+            self._refresh_history_calibration()
+            self.coordinator.handle_target_observation()
+            return self._next_mt5_command_locked()
+
     def _handle_basis_collector_message(self, payload: Mapping[str, Any]) -> None:
         if str(payload.get("event_type", "")) != "basis_history":
             return
@@ -232,8 +249,11 @@ class LiveBridgeController:
 
     def next_mt5_command(self) -> str:
         with self._lock:
-            commands = self.gateway.next_commands(limit=1)
-            return command_to_tsv(commands[0]) if commands else ""
+            return self._next_mt5_command_locked()
+
+    def _next_mt5_command_locked(self) -> str:
+        commands = self.gateway.next_commands(limit=1)
+        return command_to_tsv(commands[0]) if commands else ""
 
 
 def start_mt5_http_server(controller: LiveBridgeController, host: str, port: int) -> ThreadingHTTPServer:
@@ -314,6 +334,15 @@ def _make_handler(controller: LiveBridgeController):
                 body = self._read_json()
                 path = self.path.split("?", 1)[0]
                 if path == "/v1/mt5/snapshot":
+                    # ``poll=1`` is the low-latency EA path.  The response is
+                    # either an empty body or the same TSV command formerly
+                    # returned by /v1/mt5/command.  The old JSON response is
+                    # retained for existing EAs and diagnostic clients.
+                    query = self.path.split("?", 1)[1] if "?" in self.path else ""
+                    if "poll=1" in query.split("&"):
+                        command = controller.handle_mt5_snapshot_and_next_command(body)
+                        self._respond(200, command, content_type="text/plain; charset=utf-8")
+                        return
                     controller.handle_mt5_snapshot(body)
                 elif path == "/v1/mt5/command":
                     self._respond(200, controller.next_mt5_command(), content_type="text/plain; charset=utf-8")
