@@ -23,6 +23,13 @@ namespace AtasMt5ProbeStrategy
         [JsonProperty("source_symbol")]
         public string SourceSymbol { get; set; } = "";
 
+        // Stable logical pair identifier.  It is deliberately independent of
+        // the broker/connector symbol text (which may contain aliases or
+        // contract months) and lets several chart strategies share one
+        // authenticated WebSocket.
+        [JsonProperty("pair_tag")]
+        public string PairTag { get; set; } = "";
+
         [JsonProperty("atas_timestamp_utc")]
         public string AtasTimestampUtc { get; set; } = "";
 

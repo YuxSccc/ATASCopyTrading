@@ -45,6 +45,9 @@ class Mt5HttpGateway(TargetExecutionPort):
     # been seen, command delivery also requires a recent heartbeat; the full
     # snapshot remains the authority for execution confirmation.
     heartbeat_ttl_seconds: float = 0.5
+    # Optional logical pair identifier. Empty values preserve the legacy
+    # single-pair protocol; the multi-pair router validates it when supplied.
+    pair_tag: str | None = None
     _state: TargetAccountState | None = field(default=None, init=False)
     _state_received_at: float = field(default=0.0, init=False)
     _last_heartbeat_at: float = field(default=0.0, init=False)
@@ -88,6 +91,7 @@ class Mt5HttpGateway(TargetExecutionPort):
             raise Mt5GatewayError(f"snapshot symbol {target_symbol} does not match {self.target_symbol}")
         if int(payload.get("bridge_magic", -1)) != self.bridge_magic:
             raise Mt5GatewayError("snapshot bridge magic does not match")
+        self._validate_pair_tag(payload, "snapshot")
         # The EA's clock can be a broker/server clock and its basic datetime
         # precision is seconds. Freshness must therefore be measured at the
         # local bridge boundary, where the complete snapshot is received.
@@ -128,6 +132,7 @@ class Mt5HttpGateway(TargetExecutionPort):
             raise Mt5GatewayError(f"heartbeat symbol {target_symbol} does not match {self.target_symbol}")
         if int(payload.get("bridge_magic", -1)) != self.bridge_magic:
             raise Mt5GatewayError("heartbeat bridge magic does not match")
+        self._validate_pair_tag(payload, "heartbeat")
         quote = _parse_quote(payload.get("quote"), target_symbol, datetime.now(timezone.utc).isoformat())
         if quote is None or not quote.is_complete:
             raise Mt5GatewayError("heartbeat quote is incomplete")
@@ -268,6 +273,7 @@ class Mt5HttpGateway(TargetExecutionPort):
             self._acknowledged_receipts.setdefault(receipt.command_id, receipt)
 
     def acknowledge_command(self, payload: Mapping[str, Any]) -> ExecutionReceipt:
+        self._validate_pair_tag(payload, "receipt")
         command_id = _text(payload, "command_id")
         status = OperationStatus(_text(payload, "status"))
         receipt = ExecutionReceipt(
@@ -312,6 +318,12 @@ class Mt5HttpGateway(TargetExecutionPort):
                 }
                 self._transport_times.pop(command_id, None)
             return receipt
+
+    def _validate_pair_tag(self, payload: Mapping[str, Any], message_type: str) -> None:
+        expected = (self.pair_tag or "").strip()
+        supplied = str(payload.get("pair_tag", "")).strip()
+        if expected and supplied and supplied != expected:
+            raise Mt5GatewayError(f"{message_type} pair tag {supplied} does not match {expected}")
 
 
 def command_to_wire(command: BridgeCommand) -> dict[str, Any]:

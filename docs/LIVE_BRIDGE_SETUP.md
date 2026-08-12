@@ -7,11 +7,17 @@ demo account.
 
 ## Components
 
+The service supports multiple ATAS-to-MT5 symbol pairs through one WebSocket
+port (`8767`) and one HTTP port (`8768`). Each pair has an independent
+coordinator, gateway, basis calibration, and durable state. Use a stable
+`PairTag` in the ATAS probe and MT5 EA; during migration, a missing tag is
+routed only when source symbol or target symbol plus magic is unique.
+
 ```text
-ATAS strategy (localhost WebSocket, :8767)
-    -> Python bridge service + SQLite
-    -> localhost HTTP (:8768, loopback-only)
-    -> MT5 EA on the XAUUSD chart
+ATAS strategies (one WebSocket, :8767)
+    -> Python bridge service + per-pair SQLite coordinators
+    -> one localhost HTTP port (:8768, loopback-only)
+    -> MT5 EAs on their target charts
     -> MT5 terminal / broker
 ```
 
@@ -22,23 +28,26 @@ number, the bridge quarantines the symbol and submits nothing.
 
 ## Build and first run
 
-1. Compile `mt5_ea/AtasMt5BridgeEA.mq5` in MetaEditor, then attach it to the
-   exact target symbol chart (normally `XAUUSD`; broker suffixes require the
-   same suffix in `--target-symbol`). In the EA settings, add
+1. Compile `mt5_ea/AtasMt5BridgeEA.mq5` in MetaEditor, then attach one copy to
+   each exact target-symbol chart (for example `XAUUSD` and `USTEC`; broker
+   suffixes must match the service configuration). In the EA settings, add
    `http://127.0.0.1:8768` to MT5's allowed WebRequest URLs.
-2. Set the same Magic number on both sides. Keep `EnableExecution=false` in
-   the EA for the first run.
-3. Start the service without `--enable-execution`; it will record and validate
-   ATAS and MT5 state but cannot send a command:
+2. Set `PairTag` to the same value on the matching ATAS probe and MT5 EA. The
+   field is optional during migration; the service has a unique-symbol/magic
+   fallback. Use distinct magic numbers when possible.
+3. Start one service for all pairs. Each `--pair` is
+   `TAG=ATAS_SOURCE:MT5_TARGET:MAGIC`:
 
    ```powershell
    $env:PYTHONPATH = "src"
    python -m atas_mt5_bridge.v2.live_service `
-     --source-symbol GC `
-     --target-symbol XAUUSD `
-     --bridge-magic 26081001 `
+     --pair gc_xauusd=GC:XAUUSD:26081001 `
+     --pair nq_ustec=USTEC:USTEC:26081002 `
      --volume-multiplier 1
    ```
+
+   For the first observation run, omit `--enable-execution` and keep the EA
+   execution switch disabled. The legacy single-pair flags remain supported.
 
 4. Configure the `AtasMt5BridgeProbe` WebSocket as `ws://127.0.0.1:8767` and
    enable its embedded **Capture ATAS M1 basis history** setting. Do not add a

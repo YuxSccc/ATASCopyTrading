@@ -1,8 +1,9 @@
 #property strict
-#property version   "0.102"
+#property version   "0.103"
 #property description "Local ATAS-to-MT5 bridge observer and guarded command executor."
 
 input string BridgeBaseUrl = "http://127.0.0.1:8768";
+input string PairTag = "";
 input long BridgeMagic = 26081001;
 input bool EnableExecution = false;
 // The fast path is a quote/command heartbeat.  Complete account snapshots
@@ -111,8 +112,8 @@ bool PublishHeartbeat(string &command_response)
    MqlTick tick = {};
    SymbolInfoTick(_Symbol, tick);
    string body = StringFormat(
-      "{\"target_symbol\":\"%s\",\"bridge_magic\":%I64d,\"quote\":{\"bid\":\"%s\",\"ask\":\"%s\",\"occurred_at_utc\":\"%s\"}}",
-      EscapeJson(_Symbol), BridgeMagic, Number(tick.bid), Number(tick.ask), UtcIso(TimeGMT()));
+      "{\"target_symbol\":\"%s\",\"pair_tag\":\"%s\",\"bridge_magic\":%I64d,\"quote\":{\"bid\":\"%s\",\"ask\":\"%s\",\"occurred_at_utc\":\"%s\"}}",
+      EscapeJson(_Symbol), EscapeJson(PairTag), BridgeMagic, Number(tick.bid), Number(tick.ask), UtcIso(TimeGMT()));
    string response;
    int status = 0;
    if(!Http("POST", "/v1/mt5/heartbeat?poll=1", body, response, status))
@@ -199,11 +200,11 @@ string BuildSnapshotJson(bool include_history)
                     ? StringFormat("\"m1_bars\":[%s],\"m1_server_utc_offset_seconds\":%d,", g_m1_bars_json, g_m1_server_utc_offset_seconds)
                     : "";
    return StringFormat(
-      "{\"target_symbol\":\"%s\",\"bridge_magic\":%I64d,\"account_model\":\"%s\",\"snapshot_complete\":true,%s"
+      "{\"target_symbol\":\"%s\",\"pair_tag\":\"%s\",\"bridge_magic\":%I64d,\"account_model\":\"%s\",\"snapshot_complete\":true,%s"
       "\"long_quantity\":\"%s\",\"short_quantity\":\"%s\",\"quote\":{\"bid\":\"%s\",\"ask\":\"%s\",\"occurred_at_utc\":\"%s\"},"
       "\"symbol_spec\":{\"tick_size\":\"%s\",\"volume_min\":\"%s\",\"volume_max\":\"%s\",\"volume_step\":\"%s\",\"stops_level\":\"%s\",\"freeze_level\":\"%s\"},"
       "\"pending_orders\":[%s],\"positions\":[%s],\"foreign_symbol_objects_present\":%s}",
-      EscapeJson(_Symbol), BridgeMagic, account_model, history, Number(long_volume), Number(short_volume),
+      EscapeJson(_Symbol), EscapeJson(PairTag), BridgeMagic, account_model, history, Number(long_volume), Number(short_volume),
       Number(tick.bid), Number(tick.ask), UtcIso(TimeGMT()),
       Number(SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE)), Number(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN)),
       Number(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX)), Number(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP)),
@@ -375,8 +376,8 @@ ENUM_ORDER_TYPE_FILLING ResolveFillingMode()
 
 void SendReceipt(string command_id, string status_text, string target_reference, string message)
 {
-   g_pending_receipt_body = StringFormat("{\"command_id\":\"%s\",\"status\":\"%s\",\"target_reference\":\"%s\",\"message\":\"%s\"}",
-                                         EscapeJson(command_id), EscapeJson(status_text), EscapeJson(target_reference), EscapeJson(message));
+   g_pending_receipt_body = StringFormat("{\"command_id\":\"%s\",\"pair_tag\":\"%s\",\"status\":\"%s\",\"target_reference\":\"%s\",\"message\":\"%s\"}",
+                                         EscapeJson(command_id), EscapeJson(PairTag), EscapeJson(status_text), EscapeJson(target_reference), EscapeJson(message));
    FlushPendingReceipt();
 }
 
@@ -433,7 +434,23 @@ bool SaveCommandState(string command_id, string phase, string target_reference)
 
 string CommandStateFileName()
 {
-   return StringFormat("AtasMt5BridgeEA-%I64d.state", BridgeMagic);
+   return StringFormat("AtasMt5BridgeEA-%I64d-%s-%s.state", BridgeMagic, StateComponent(_Symbol), StateComponent(PairTag));
+}
+
+string StateComponent(string value)
+{
+   StringReplace(value, "\\", "_");
+   StringReplace(value, "/", "_");
+   StringReplace(value, ":", "_");
+   StringReplace(value, "*", "_");
+   StringReplace(value, "?", "_");
+   StringReplace(value, "\"", "_");
+   StringReplace(value, "<", "_");
+   StringReplace(value, ">", "_");
+   StringReplace(value, "|", "_");
+   if(StringLen(value) == 0)
+      return "default";
+   return value;
 }
 
 bool Http(string method, string endpoint, string body, string &response, int &status)

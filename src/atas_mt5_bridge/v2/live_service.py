@@ -33,6 +33,7 @@ class LiveBridgeController:
     bridge_magic: int
     database_path: Path
     journal_path: Path
+    pair_tag: str = ""
     basis_recording_directory: Path | None = None
     execution_enabled: bool = False
     volume_multiplier: Decimal = Decimal("1")
@@ -46,7 +47,7 @@ class LiveBridgeController:
 
     def __post_init__(self) -> None:
         self.state_store = SqliteBridgeStateStore(self.database_path)
-        self.gateway = Mt5HttpGateway(self.target_symbol, self.bridge_magic)
+        self.gateway = Mt5HttpGateway(self.target_symbol, self.bridge_magic, pair_tag=self.pair_tag or None)
         # Calibration must run in observation mode too. Otherwise the first
         # live order has neither a measured GC/XAUUSD basis nor evidence that
         # the chosen guard thresholds match the broker's feed.
@@ -251,6 +252,10 @@ class LiveBridgeController:
             target_state = self.gateway.latest_state()
             mapper = self.coordinator.policy.price_mapper
             return {
+                "pair_tag": self.pair_tag,
+                "source_symbol": self.source_symbol,
+                "target_symbol": self.target_symbol,
+                "bridge_magic": self.bridge_magic,
                 "execution_enabled": self.execution_enabled,
                 "source_synchronized": self.coordinator.source_book.has_synchronized_snapshot,
                 "source_position_complete": self.coordinator.source_book.snapshot().position_complete
@@ -294,7 +299,109 @@ class LiveBridgeController:
         return command_to_tsv(commands[0]) if commands else ""
 
 
-def start_mt5_http_server(controller: LiveBridgeController, host: str, port: int) -> ThreadingHTTPServer:
+@dataclass
+class PairRoutedBridgeController:
+    """Route several isolated symbol runtimes through one local transport.
+
+    ``pair_tag`` is the preferred routing key.  During rollout, clients that
+    have not yet been rebuilt may omit it; ATAS then matches a unique source
+    symbol and MT5 matches the unique target-symbol/magic tuple.  Ambiguous
+    messages are rejected instead of being sent to the wrong account leg.
+    """
+
+    runtimes: dict[str, LiveBridgeController]
+    test_controller: DemoTestController | None = None
+    default_pair_tag: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.runtimes:
+            raise ValueError("at least one pair runtime is required")
+        self.runtimes = {_pair_key(tag): runtime for tag, runtime in self.runtimes.items()}
+        if self.default_pair_tag is None:
+            self.default_pair_tag = next(iter(self.runtimes))
+
+    def _resolve(self, payload: Mapping[str, Any], kind: str) -> LiveBridgeController:
+        supplied = str(payload.get("pair_tag", "")).strip()
+        if supplied:
+            runtime = self.runtimes.get(_pair_key(supplied))
+            if runtime is None:
+                raise ValueError(f"unknown pair_tag: {supplied}")
+            return runtime
+
+        if kind == "atas":
+            value = str(payload.get("source_symbol", "")).strip().lower()
+            candidates = [item for item in self.runtimes.values() if item.source_symbol.strip().lower() == value]
+        elif kind == "mt5":
+            symbol = str(payload.get("target_symbol", "")).strip().lower()
+            try:
+                magic = int(payload.get("bridge_magic", -1))
+            except (TypeError, ValueError):
+                magic = -1
+            candidates = [
+                item for item in self.runtimes.values()
+                if item.target_symbol.strip().lower() == symbol and item.bridge_magic == magic
+            ]
+        else:
+            command_id = str(payload.get("command_id", "")).strip()
+            candidates = [
+                item for item in self.runtimes.values()
+                if command_id in item.coordinator.operation_book.records
+                or command_id in item.gateway._queued_commands
+                or command_id in item.gateway._quarantined_commands
+            ]
+
+        if len(candidates) == 1:
+            return candidates[0]
+        if not candidates:
+            raise ValueError(f"cannot route {kind} message without pair_tag")
+        raise ValueError(f"ambiguous {kind} message; pair_tag is required")
+
+    def handle_atas_message(self, payload: Mapping[str, Any]) -> None:
+        self._resolve(payload, "atas").handle_atas_message(payload)
+
+    def handle_mt5_snapshot(self, payload: Mapping[str, Any]) -> None:
+        self._resolve(payload, "mt5").handle_mt5_snapshot(payload)
+
+    def handle_mt5_snapshot_and_next_command(self, payload: Mapping[str, Any]) -> str:
+        return self._resolve(payload, "mt5").handle_mt5_snapshot_and_next_command(payload)
+
+    def handle_mt5_heartbeat(self, payload: Mapping[str, Any]) -> None:
+        self._resolve(payload, "mt5").handle_mt5_heartbeat(payload)
+
+    def handle_mt5_heartbeat_and_next_command(self, payload: Mapping[str, Any]) -> str:
+        return self._resolve(payload, "mt5").handle_mt5_heartbeat_and_next_command(payload)
+
+    def handle_mt5_receipt(self, payload: Mapping[str, Any]) -> None:
+        self._resolve(payload, "receipt").handle_mt5_receipt(payload)
+
+    def confirm_no_effect_after_operator_check(self, command_id: str) -> None:
+        self._resolve({"command_id": command_id}, "receipt").confirm_no_effect_after_operator_check(command_id)
+
+    def next_mt5_command(self) -> str:
+        # The legacy GET endpoint has no symbol in its request. Keep it useful
+        # for a one-pair setup; multi-pair EAs use the in-band POST response.
+        runtime = self.runtimes[_pair_key(self.default_pair_tag or "")]
+        return runtime.next_mt5_command()
+
+    def tick(self) -> None:
+        for runtime in self.runtimes.values():
+            runtime.tick()
+
+    def status(self) -> dict[str, object]:
+        pairs = {tag: runtime.status() for tag, runtime in self.runtimes.items()}
+        default = pairs[_pair_key(self.default_pair_tag or "")]
+        return {**default, "pairs": pairs, "pair_count": len(pairs)}
+
+    def close(self) -> None:
+        for runtime in self.runtimes.values():
+            runtime.close()
+
+
+def _pair_key(value: str) -> str:
+    return str(value).strip().lower()
+
+
+def start_mt5_http_server(controller: object, host: str, port: int) -> ThreadingHTTPServer:
     handler = _make_handler(controller)
     server = ThreadingHTTPServer((host, port), handler)
     Thread(target=server.serve_forever, name="mt5-http", daemon=True).start()
@@ -544,9 +651,16 @@ async def serve(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Local ATAS/MT5 bridge service.")
-    parser.add_argument("--source-symbol", required=True)
+    parser.add_argument("--source-symbol", required=False)
     parser.add_argument("--target-symbol", default="XAUUSD")
-    parser.add_argument("--bridge-magic", type=int, required=True)
+    parser.add_argument("--bridge-magic", type=int, required=False)
+    parser.add_argument(
+        "--pair",
+        action="append",
+        default=[],
+        metavar="TAG=SOURCE:TARGET:MAGIC",
+        help="repeat for one-port multi-pair routing; legacy single-pair flags remain supported",
+    )
     parser.add_argument("--state-db", default="bridge-state/bridge.db")
     parser.add_argument("--journal", default="bridge-state/operations.jsonl")
     parser.add_argument("--output-dir", default="probe-data")
@@ -568,30 +682,41 @@ def main() -> int:
         parser.error("basis window and half-life must be positive")
     if args.basis_minimum_samples <= 0 or args.quote_max_age_ms <= 0 or args.basis_sample_interval_seconds <= 0:
         parser.error("basis sample count, sample interval, and quote maximum age must be positive")
+    try:
+        pair_specs = _parse_pair_specs(args)
+    except ValueError as error:
+        parser.error(str(error))
     test_controller = DemoTestController(
         enabled=args.enable_test_control,
         report_path=Path(args.output_dir) / "test_runs.jsonl",
     )
-    controller = LiveBridgeController(
-        source_symbol=args.source_symbol,
-        target_symbol=args.target_symbol,
-        bridge_magic=args.bridge_magic,
-        database_path=Path(args.state_db),
-        journal_path=Path(args.journal),
-        basis_recording_directory=Path(args.output_dir),
-        execution_enabled=args.enable_execution,
-        volume_multiplier=args.volume_multiplier,
-        price_guard_config=PriceGuardConfig(
-            basis_window=timedelta(seconds=args.basis_window_seconds),
-            basis_half_life=timedelta(seconds=args.basis_half_life_seconds),
-            minimum_basis_samples=args.basis_minimum_samples,
-            minimum_sample_interval=timedelta(seconds=args.basis_sample_interval_seconds),
-            quote_max_age=timedelta(milliseconds=args.quote_max_age_ms),
-            max_current_basis_deviation=args.max_current_basis_deviation,
-            max_basis_dispersion=args.max_basis_dispersion,
-        ),
-        test_controller=test_controller,
+    price_guard_config = PriceGuardConfig(
+        basis_window=timedelta(seconds=args.basis_window_seconds),
+        basis_half_life=timedelta(seconds=args.basis_half_life_seconds),
+        minimum_basis_samples=args.basis_minimum_samples,
+        minimum_sample_interval=timedelta(seconds=args.basis_sample_interval_seconds),
+        quote_max_age=timedelta(milliseconds=args.quote_max_age_ms),
+        max_current_basis_deviation=args.max_current_basis_deviation,
+        max_basis_dispersion=args.max_basis_dispersion,
     )
+    runtimes = {
+        tag: LiveBridgeController(
+            source_symbol=source_symbol,
+            target_symbol=target_symbol,
+            bridge_magic=bridge_magic,
+            database_path=Path(args.state_db),
+            journal_path=Path(args.journal),
+            pair_tag=tag,
+            basis_recording_directory=Path(args.output_dir),
+            execution_enabled=args.enable_execution,
+            volume_multiplier=args.volume_multiplier,
+            price_guard_config=price_guard_config,
+            test_controller=test_controller,
+        )
+        for tag, source_symbol, target_symbol, bridge_magic in pair_specs
+    }
+    controller: PairRoutedBridgeController | LiveBridgeController
+    controller = PairRoutedBridgeController(runtimes, test_controller=test_controller) if len(runtimes) > 1 else next(iter(runtimes.values()))
     server = start_mt5_http_server(controller, "127.0.0.1", args.mt5_http_port)
     test_server = (
         start_test_http_server(test_controller, "127.0.0.1", args.test_http_port)
@@ -616,6 +741,35 @@ def main() -> int:
             test_server.server_close()
         controller.close()
     return 0
+
+
+def _parse_pair_specs(args: argparse.Namespace) -> list[tuple[str, str, str, int]]:
+    if args.pair:
+        if args.source_symbol or args.bridge_magic is not None:
+            raise ValueError("use either --pair or legacy --source-symbol/--bridge-magic, not both")
+        result: list[tuple[str, str, str, int]] = []
+        seen: set[str] = set()
+        for raw in args.pair:
+            if "=" not in raw:
+                raise ValueError(f"invalid --pair {raw!r}; expected TAG=SOURCE:TARGET:MAGIC")
+            tag, details = raw.split("=", 1)
+            parts = details.split(":")
+            if len(parts) != 3 or not all(part.strip() for part in parts):
+                raise ValueError(f"invalid --pair {raw!r}; expected TAG=SOURCE:TARGET:MAGIC")
+            source, target, magic_text = (part.strip() for part in parts)
+            try:
+                magic = int(magic_text)
+            except ValueError as error:
+                raise ValueError(f"invalid bridge magic in --pair {raw!r}") from error
+            key = _pair_key(tag)
+            if not key or key in seen:
+                raise ValueError(f"duplicate/empty pair tag in --pair {raw!r}")
+            seen.add(key)
+            result.append((tag.strip(), source, target, magic))
+        return result
+    if not args.source_symbol or args.bridge_magic is None:
+        raise ValueError("--source-symbol and --bridge-magic are required when --pair is not used")
+    return [("", args.source_symbol, args.target_symbol, args.bridge_magic)]
 
 
 if __name__ == "__main__":

@@ -67,6 +67,10 @@ namespace AtasMt5ProbeStrategy
         public string SourceSymbolOverride { get; set; } = "";
 
         [OFT.Attributes.ParameterAttribute]
+        [DisplayName("Pair tag")]
+        public string PairTag { get; set; } = "";
+
+        [OFT.Attributes.ParameterAttribute]
         [DisplayName("Delivery mode: async or sync")]
         public string DeliveryMode { get; set; } = "async";
 
@@ -154,7 +158,7 @@ namespace AtasMt5ProbeStrategy
                 captured_from = "current_position_startup",
             };
             StrategyLog.Append(
-                $"Started bridge probe build={BuildTag}, session={_sessionId}, source={GetSourceSymbol()}, " +
+                $"Started bridge probe build={BuildTag}, session={_sessionId}, source={GetSourceSymbol()}, pair={NormalizedPairTag()}, " +
                 $"server={ServerUrl}, delivery={NormalizedDeliveryMode()}\n");
             _ = SendStartupSnapshotAsync();
         }
@@ -407,6 +411,7 @@ namespace AtasMt5ProbeStrategy
                     EventId = ++_eventSequence,
                     EventType = eventType,
                     SourceSymbol = GetSourceSymbol(),
+                    PairTag = NormalizedPairTag(),
                     AtasTimestampUtc = DateTimeOffset.UtcNow.ToString("O"),
                     LocalMonotonicTicks = Stopwatch.GetTimestamp(),
                     LocalStopwatchFrequency = Stopwatch.Frequency,
@@ -586,6 +591,11 @@ namespace AtasMt5ProbeStrategy
             return string.IsNullOrWhiteSpace(SourceSymbolOverride)
                 ? Security?.ToString() ?? ""
                 : SourceSymbolOverride.Trim();
+        }
+
+        private string NormalizedPairTag()
+        {
+            return PairTag?.Trim() ?? "";
         }
 
         private bool IsCurrentChartSecurity(string? securityId)

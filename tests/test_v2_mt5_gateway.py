@@ -9,7 +9,12 @@ from urllib.request import Request, urlopen
 import pytest
 
 from atas_mt5_bridge.v2.models import BridgeCommand, CommandType, OperationStatus
-from atas_mt5_bridge.v2.live_service import LiveBridgeController, _merge_minute_bars, start_mt5_http_server
+from atas_mt5_bridge.v2.live_service import (
+    LiveBridgeController,
+    PairRoutedBridgeController,
+    _merge_minute_bars,
+    start_mt5_http_server,
+)
 from atas_mt5_bridge.v2.test_control import DemoTestController
 from atas_mt5_bridge.v2.mt5_gateway import Mt5GatewayError, Mt5HttpGateway, command_to_tsv
 
@@ -44,6 +49,39 @@ def snapshot() -> dict:
         ],
         "positions": [{"ticket": "9", "side": "long", "quantity": "1", "stop_loss": "0", "take_profit": "4010"}],
     }
+
+
+def test_pair_tagged_gateways_share_one_controller_without_cross_symbol_routing(tmp_path: Path):
+    gc = LiveBridgeController(
+        source_symbol="GC",
+        target_symbol="XAUUSD",
+        bridge_magic=26081001,
+        pair_tag="gc_xauusd",
+        database_path=tmp_path / "state.db",
+        journal_path=tmp_path / "ops.jsonl",
+    )
+    nq = LiveBridgeController(
+        source_symbol="USTEC",
+        target_symbol="USTEC",
+        bridge_magic=26081002,
+        pair_tag="nq_ustec",
+        database_path=tmp_path / "state.db",
+        journal_path=tmp_path / "ops.jsonl",
+    )
+    controller = PairRoutedBridgeController(
+        {"gc_xauusd": gc, "nq_ustec": nq},
+        default_pair_tag="gc_xauusd",
+    )
+    try:
+        nq_snapshot = {**snapshot(), "target_symbol": "USTEC", "bridge_magic": 26081002, "pair_tag": "nq_ustec"}
+        controller.handle_mt5_snapshot(nq_snapshot)
+        status = controller.status()
+        assert status["pairs"]["nq_ustec"]["target_snapshot_received"] is True
+        assert status["pairs"]["gc_xauusd"]["target_snapshot_received"] is False
+        with pytest.raises(ValueError, match="unknown pair_tag"):
+            controller.handle_mt5_snapshot({**nq_snapshot, "pair_tag": "wrong"})
+    finally:
+        controller.close()
 
 
 def command() -> BridgeCommand:
