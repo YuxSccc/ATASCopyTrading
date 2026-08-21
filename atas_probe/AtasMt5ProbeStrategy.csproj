@@ -2,9 +2,15 @@
   <PropertyGroup>
     <!-- ATAS 8.0.14 is hosted on .NET 10. Targeting its runtime prevents
          System.Runtime version conflicts when using its trading APIs. -->
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
     <Nullable>enable</Nullable>
-    <AssemblyName>AtasMt5ProbeStrategy</AssemblyName>
+    <!-- ATAS keeps a loaded strategy assembly resident even after its DLL is
+         replaced. A new assembly identity makes a hot-deployed bridge build
+         deterministic instead of silently running the previous code. -->
+    <AssemblyName>AtasMt5ProbeStrategyV5</AssemblyName>
+    <AssemblyVersion>5.0.0.0</AssemblyVersion>
+    <FileVersion>5.0.0.0</FileVersion>
     <RootNamespace>AtasMt5ProbeStrategy</RootNamespace>
   </PropertyGroup>
 

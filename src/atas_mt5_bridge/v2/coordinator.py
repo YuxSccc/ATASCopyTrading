@@ -271,14 +271,6 @@ class SymbolCoordinator:
                 reconciliation_required=True,
                 reason="target command outcome requires operator reconciliation",
             )
-        if self.operation_book.has_in_flight():
-            return CoordinationResult(
-                sequence_status=sequence_status,
-                source_state=state,
-                reconciliation_required=False,
-                reason="waiting for target snapshot to confirm prior command",
-            )
-
         commands = self.policy.plan(state, target, self.ledger)
         if not self._persist_market_state():
             self.reconciliation_required = True
@@ -288,6 +280,34 @@ class SymbolCoordinator:
                 reconciliation_required=True,
                 reason="market-state persistence failed; target execution is blocked",
             )
+
+        # Normally one unconfirmed target command serializes the symbol.  The
+        # sole exception is a source-authoritative cancellation of a pending
+        # order for which the EA returned a concrete MT5 ticket.  That command
+        # removes risk; holding it behind a stale full snapshot is exactly how
+        # a cancelled ATAS order used to survive on MT5.
+        if self.operation_book.has_in_flight():
+            cancellation = self._select_next_command(
+                tuple(command for command in commands if command.command_type == CommandType.CANCEL_PENDING)
+            )
+            if cancellation is None:
+                return CoordinationResult(
+                    sequence_status=sequence_status,
+                    source_state=state,
+                    reconciliation_required=False,
+                    reason="waiting for target snapshot to confirm prior command",
+                )
+            command = self.operation_book.allocate_attempt(cancellation)
+            receipt = self._dispatch(command)
+            return CoordinationResult(
+                sequence_status=sequence_status,
+                source_state=state,
+                commands=(command,),
+                receipts=(receipt,),
+                reconciliation_required=self.reconciliation_required,
+                reason="target execution uncertainty" if self.reconciliation_required else None,
+            )
+
         command = self._select_next_command(commands)
         if command is None:
             return CoordinationResult(sequence_status=sequence_status, source_state=state)
@@ -452,6 +472,18 @@ class SymbolCoordinator:
     def _apply_receipt(self, command: BridgeCommand, receipt: ExecutionReceipt) -> None:
         if command.leg_id is None:
             return
+        if command.command_type == CommandType.CREATE_PENDING and receipt.status in {
+            OperationStatus.ACCEPTED,
+            OperationStatus.CONFIRMED,
+        }:
+            ticket = _valid_target_ticket(receipt.target_reference)
+            if ticket is not None:
+                leg = self.ledger.get_leg(command.leg_id)
+                if leg is not None and leg.state == TargetLegState.CREATE_PENDING:
+                    # Keep CREATE_PENDING until the complete MT5 snapshot
+                    # confirms existence, but retain the ticket so an ATAS
+                    # cancellation can be targeted immediately.
+                    self.ledger.update_leg(replace(leg, target_order_ticket=ticket))
         if receipt.status == OperationStatus.FAILED:
             self.ledger.mark_leg_failed(command.leg_id)
         elif receipt.status == OperationStatus.UNKNOWN:
@@ -494,3 +526,13 @@ class SymbolCoordinator:
             CommandType.RECONCILE: 6,
         }
         return min(commands, key=lambda command: priority[command.command_type]) if commands else None
+
+
+def _valid_target_ticket(value: str | None) -> str | None:
+    """Return a non-zero MT5 ticket from an EA receipt, if one was supplied."""
+
+    try:
+        ticket = int(str(value or "").strip())
+    except ValueError:
+        return None
+    return str(ticket) if ticket > 0 else None

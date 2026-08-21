@@ -11,6 +11,9 @@ namespace AtasMt5ProbeStrategy
 {
     internal sealed class ProbeWebSocketClient : IDisposable
     {
+        private static readonly string DiagnosticPath = Path.Combine(
+            Path.GetTempPath(),
+            "atas-mt5-probe-client.log");
         private readonly Uri _serverUri;
         private readonly SemaphoreSlim _connectionLock = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim _sendLock = new SemaphoreSlim(1, 1);
@@ -30,6 +33,8 @@ namespace AtasMt5ProbeStrategy
 
         public bool IsConnected => !_disposed && _socket?.State == WebSocketState.Open;
 
+        public string LastError { get; private set; } = "";
+
         public async Task<bool> EnsureConnectedAsync()
         {
             if (IsConnected)
@@ -43,13 +48,20 @@ namespace AtasMt5ProbeStrategy
 
                 CloseSocket();
                 var socket = new ClientWebSocket();
+                // The bridge is always local. Do not let a machine-level
+                // proxy configuration intercept or delay loopback traffic.
+                socket.Options.Proxy = null;
                 await socket.ConnectAsync(_serverUri, _cts.Token);
                 _socket = socket;
                 _receiveLoop = Task.Run(ReceiveLoopAsync);
+                LastError = "";
+                WriteDiagnostic($"connected uri={_serverUri}");
                 return true;
             }
-            catch
+            catch (Exception ex)
             {
+                LastError = ex.GetType().Name + ": " + ex.Message;
+                WriteDiagnostic($"connect_failed uri={_serverUri} error={LastError}");
                 CloseSocket();
                 return false;
             }
@@ -177,6 +189,20 @@ namespace AtasMt5ProbeStrategy
             finally
             {
                 _socket = null;
+            }
+        }
+
+        private static void WriteDiagnostic(string message)
+        {
+            try
+            {
+                File.AppendAllText(
+                    DiagnosticPath,
+                    $"{DateTimeOffset.UtcNow:O} {message}{Environment.NewLine}");
+            }
+            catch
+            {
+                // Diagnostics must never affect ATAS order callbacks.
             }
         }
 

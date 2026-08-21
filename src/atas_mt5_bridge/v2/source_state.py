@@ -30,6 +30,10 @@ class SourceStateBook:
     _synchronized: bool = False
     _quote: SourceQuote | None = None
     _position_complete: bool = False
+    _source_account: str = ""
+    _orders_complete: bool = False
+    _explicitly_removed_order_ids: set[str] = field(default_factory=set)
+    _dispatchable_order_ids: set[str] = field(default_factory=set)
 
     @property
     def has_synchronized_snapshot(self) -> bool:
@@ -39,11 +43,35 @@ class SourceStateBook:
         if event.source_symbol != self.source_symbol:
             raise ValueError(f"event belongs to {event.source_symbol}, expected {self.source_symbol}")
 
-        if self._session_id is None or event.session_id != self._session_id:
+        event_account = event.source_account.strip()
+        # ATAS currently exposes the account as a display string such as
+        # ``2268517 Bal:120245/114530.75/...``. Margin and available funds
+        # change whenever an order is placed or cancelled; comparing the
+        # whole display value would turn an ordinary cancellation into a false
+        # account switch and discard that cancellation event.
+        account_changed = bool(
+            event_account
+            and self._source_account
+            and _account_identity(event_account) != _account_identity(self._source_account)
+        )
+        if account_changed:
             self._reset_for_session(event.session_id)
+            self._source_account = event_account
+            if event.event_type != SourceEventType.SNAPSHOT:
+                self._last_event_id = event.event_id
+                return SequenceStatus.ACCOUNT_RESET
+        elif self._session_id is None or event.session_id != self._session_id:
+            self._reset_for_session(event.session_id)
+            # A new session without an account identity must not inherit a
+            # stale portfolio label from the previous connector session.
+            self._source_account = event_account
             if event.event_type != SourceEventType.SNAPSHOT:
                 self._last_event_id = event.event_id
                 return SequenceStatus.SESSION_RESET
+        elif event_account:
+            # Preserve the raw label for diagnostics while comparing only its
+            # stable account identity above.
+            self._source_account = event_account
 
         if event.event_id <= self._last_event_id:
             return SequenceStatus.DUPLICATE_OR_OLD
@@ -75,6 +103,10 @@ class SourceStateBook:
             synchronized=self._synchronized,
             quote=self._quote,
             position_complete=self._position_complete,
+            source_account=self._source_account,
+            orders_complete=self._orders_complete,
+            explicitly_removed_order_ids=frozenset(self._explicitly_removed_order_ids),
+            dispatchable_order_ids=frozenset(self._dispatchable_order_ids),
         )
 
     def restore(self, state: SourceSymbolState) -> None:
@@ -89,6 +121,14 @@ class SourceStateBook:
         self._synchronized = state.synchronized
         self._quote = state.quote
         self._position_complete = state.position_complete
+        self._source_account = state.source_account
+        self._orders_complete = state.orders_complete
+        self._explicitly_removed_order_ids = set(state.explicitly_removed_order_ids)
+        # A persisted active order may have been cancelled while the bridge
+        # was down. Keep it only as non-destructive reconciliation context;
+        # a fresh callback or a complete ATAS inventory is required before a
+        # new MT5 pending order can be created.
+        self._dispatchable_order_ids.clear()
 
     def _reset_for_session(self, session_id: str) -> None:
         self._session_id = session_id
@@ -98,6 +138,9 @@ class SourceStateBook:
         self._synchronized = False
         self._quote = None
         self._position_complete = False
+        self._orders_complete = False
+        self._explicitly_removed_order_ids.clear()
+        self._dispatchable_order_ids.clear()
 
     def _apply_payload(self, event: SourceEvent) -> None:
         if event.event_type == SourceEventType.SNAPSHOT:
@@ -109,6 +152,9 @@ class SourceStateBook:
                     for order in event.snapshot_orders
                     if order.is_active
                 }
+                self._orders_complete = True
+                self._explicitly_removed_order_ids.clear()
+                self._dispatchable_order_ids = set(self._active_orders)
         elif event.event_type == SourceEventType.POSITION:
             self._position = event.position
             self._position_complete = True
@@ -117,5 +163,23 @@ class SourceStateBook:
         elif event.order is not None:
             if event.order.is_active:
                 self._active_orders[event.order.source_order_id] = event.order
+                self._explicitly_removed_order_ids.discard(event.order.source_order_id)
+                self._dispatchable_order_ids.add(event.order.source_order_id)
             else:
                 self._active_orders.pop(event.order.source_order_id, None)
+                self._explicitly_removed_order_ids.add(event.order.source_order_id)
+                self._dispatchable_order_ids.discard(event.order.source_order_id)
+
+
+def _account_identity(value: str) -> str:
+    """Extract an ATAS account's stable identifier from a display label."""
+
+    normalized = " ".join(value.strip().split())
+    if not normalized:
+        return ""
+    marker = normalized.casefold().find(" bal:")
+    if marker >= 0:
+        return normalized[:marker].strip()
+    # Other connectors may not use the Rithmic-style ``Bal:`` suffix. Their
+    # full label remains the conservative identity until adapted explicitly.
+    return normalized

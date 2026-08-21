@@ -75,9 +75,23 @@ class OperationBook:
         return updated
 
     def resolve_from_snapshot(self, target: TargetAccountState, ledger: IntentLedger) -> tuple[OperationRecord, ...]:
+        if not target.snapshot_complete:
+            return ()
         resolved: list[OperationRecord] = []
         for command_id, record in tuple(self.records.items()):
-            if record.status not in {OperationStatus.PENDING, OperationStatus.ACCEPTED, OperationStatus.CONFIRMED, OperationStatus.UNKNOWN}:
+            observable_statuses = {
+                OperationStatus.PENDING,
+                OperationStatus.ACCEPTED,
+                OperationStatus.CONFIRMED,
+                OperationStatus.UNKNOWN,
+            }
+            # A failed cancellation is normally quarantined.  The one safe
+            # automatic release is a later *complete* snapshot proving the
+            # target pending order is already absent; retrying or retaining
+            # that failure would only block unrelated new source orders.
+            if record.status == OperationStatus.FAILED and record.command.command_type == CommandType.CANCEL_PENDING:
+                observable_statuses.add(OperationStatus.FAILED)
+            if record.status not in observable_statuses:
                 continue
             if not self._is_observed(record.command, target, ledger):
                 continue
@@ -128,6 +142,26 @@ class OperationBook:
             record,
             status=OperationStatus.OBSERVED_NO_EFFECT,
             message="operator confirmed no target-side effect after reviewing a complete snapshot",
+            resolved_at_utc=_now(),
+        )
+        self.records[command_id] = updated
+        return updated
+
+    def discard_before_delivery(self, command_id: str) -> OperationRecord:
+        """Resolve a command proved never to have been offered to the EA.
+
+        This is narrower than :meth:`confirm_no_effect`: the local gateway
+        establishes that no HTTP poll has returned the command, so there is no
+        broker-side ambiguity and no operator action is required.
+        """
+
+        record = self._require(command_id)
+        if record.status != OperationStatus.PENDING or record.resolved_at_utc is not None:
+            raise ValueError("only an undelivered pending command can be discarded")
+        updated = replace(
+            record,
+            status=OperationStatus.OBSERVED_NO_EFFECT,
+            message="source intent was superseded before the command was offered to the MT5 EA",
             resolved_at_utc=_now(),
         )
         self.records[command_id] = updated

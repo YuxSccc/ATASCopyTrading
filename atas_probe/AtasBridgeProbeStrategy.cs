@@ -17,10 +17,10 @@ namespace AtasMt5ProbeStrategy
     /// available from the installed ATAS version before copy logic is introduced.
     /// </summary>
     [Category("Custom")]
-    [DisplayName("AtasMt5BridgeProbe")]
+    [DisplayName("AtasMt5BridgeProbeV6")]
     public sealed class AtasBridgeProbeStrategy : ChartStrategy
     {
-        private const string BuildTag = "2026-08-12-probe-v3-embedded-basis";
+        private const string BuildTag = "2026-08-22-probe-v6-safe-basis";
         private ProbeWebSocketClient? _client;
         private string _sessionId = "";
         private long _eventSequence;
@@ -40,9 +40,9 @@ namespace AtasMt5ProbeStrategy
         // be built from callback-derived state rather than Orders.
         private readonly object _observedOrdersLock = new object();
         private readonly Dictionary<string, ObservedOrder> _observedOrders = new Dictionary<string, ObservedOrder>();
-        private ITradesCache? _basisTrades;
         private readonly SortedDictionary<DateTime, decimal> _basisMinuteCloses = new SortedDictionary<DateTime, decimal>();
         private long _lastBasisExportTicks;
+        private long _basisEligibleAfterTicks;
         private bool _basisRequestInFlight;
         private bool _basisRequestCompleted;
         private long _basisHistoricalTickCount;
@@ -108,7 +108,7 @@ namespace AtasMt5ProbeStrategy
 
         [OFT.Attributes.ParameterAttribute]
         [DisplayName("Basis refresh interval seconds")]
-        public int BasisRefreshIntervalSeconds { get; set; } = 60;
+        public int BasisRefreshIntervalSeconds { get; set; } = 900;
 
         [OFT.Attributes.ParameterAttribute]
         [DisplayName("ATAS API timestamp UTC offset minutes")]
@@ -132,14 +132,14 @@ namespace AtasMt5ProbeStrategy
             _client = new ProbeWebSocketClient(ServerUrl);
             _basisMinuteCloses.Clear();
             _lastBasisExportTicks = 0;
+            // Cumulative-trade history is optional enrichment. ATAS may have
+            // a platform-level request still in progress while a strategy is
+            // being loaded; never let that request interfere with the order
+            // bridge handshake or callbacks.
+            _basisEligibleAfterTicks = Stopwatch.GetTimestamp() + (30L * Stopwatch.Frequency);
             _basisRequestInFlight = false;
             _basisRequestCompleted = false;
             _basisHistoricalTickCount = 0;
-            _basisTrades = CaptureBasisHistory
-                ? GetTradesCache(TimeSpan.FromMinutes(Math.Max(1, BasisHistoryBars)))
-                : null;
-            if (CaptureBasisHistory)
-                RequestBasisHistoryWindow();
 
             // ATAS does not guarantee an immediate OnPositionChanged callback
             // when a chart strategy is attached to an already-flat chart.  A
@@ -224,13 +224,12 @@ namespace AtasMt5ProbeStrategy
             if (_disposed || !CaptureBasisHistory || !CanExportBasisHistory())
                 return;
 
-            MergeCachedBasisTrades();
             PruneBasisMinuteCloses();
             EmitBasisHistory();
             // This is an ATAS-side pull. Refresh the historical window after
             // the prior request completes instead of waiting for a passive
             // trade callback or a second strategy.
-            RequestBasisHistoryWindow();
+            TryRequestBasisHistoryWindow();
         }
 
         protected override void OnSuspended() => StopProbe();
@@ -267,7 +266,12 @@ namespace AtasMt5ProbeStrategy
         private bool CanExportBasisHistory()
         {
             var now = Stopwatch.GetTimestamp();
-            var intervalTicks = Stopwatch.Frequency * Math.Max(1, BasisRefreshIntervalSeconds);
+            if (now < Interlocked.Read(ref _basisEligibleAfterTicks))
+                return false;
+            // A cumulative-trades request can contain more than a million
+            // ticks.  It must never compete with order callbacks once per
+            // chart calculation; quotes provide the live basis meanwhile.
+            var intervalTicks = Stopwatch.Frequency * Math.Max(900, BasisRefreshIntervalSeconds);
             var previous = Interlocked.Read(ref _lastBasisExportTicks);
             if (previous != 0 && now - previous < intervalTicks)
                 return false;
@@ -275,22 +279,32 @@ namespace AtasMt5ProbeStrategy
             return true;
         }
 
-        private void RequestBasisHistoryWindow()
+        private void TryRequestBasisHistoryWindow()
         {
             if (!CaptureBasisHistory || _basisRequestInFlight)
                 return;
 
-            var endUtcTime = UtcTime;
-            var startUtcTime = endUtcTime.AddMinutes(-Math.Max(1, BasisHistoryBars));
-            _basisRequestInFlight = true;
-            RequestForCumulativeTrades(new CumulativeTradesRequest(startUtcTime, endUtcTime, 0, 0));
-            StrategyLog.Append($"Basis history requested start={startUtcTime:O}, end={endUtcTime:O}\n");
-        }
-
-        private void MergeCachedBasisTrades()
-        {
-            foreach (var trade in _basisTrades?.CachedItems ?? Enumerable.Empty<MarketDataArg>())
-                AddBasisTrade(trade.Time, trade.Price);
+            try
+            {
+                var endUtcTime = UtcTime;
+                var startUtcTime = endUtcTime.AddMinutes(-Math.Max(1, BasisHistoryBars));
+                _basisRequestInFlight = true;
+                RequestForCumulativeTrades(new CumulativeTradesRequest(startUtcTime, endUtcTime, 0, 0));
+                StrategyLog.Append($"Basis history requested start={startUtcTime:O}, end={endUtcTime:O}\n");
+            }
+            catch (ArgumentException ex)
+            {
+                // ATAS permits only one outstanding cumulative-trade request.
+                // Defer instead of aborting strategy initialization or the
+                // order-event pipeline; the next scheduled refresh retries.
+                _basisRequestInFlight = false;
+                StrategyLog.Append($"Basis history deferred: {ex.Message}\n");
+            }
+            catch (Exception ex)
+            {
+                _basisRequestInFlight = false;
+                StrategyLog.Append($"Basis history request error: {ex.Message}\n");
+            }
         }
 
         private void AddBasisTrade(DateTime chartTime, decimal price)
@@ -345,7 +359,8 @@ namespace AtasMt5ProbeStrategy
             {
                 if (_client == null || !await _client.EnsureConnectedAsync())
                 {
-                    StrategyLog.Append("Probe server is unavailable; startup snapshot was not sent\n");
+                    StrategyLog.Append(
+                        $"Probe server is unavailable; startup snapshot was not sent. error={_client?.LastError}\n");
                     return;
                 }
 
@@ -412,6 +427,7 @@ namespace AtasMt5ProbeStrategy
                     EventType = eventType,
                     SourceSymbol = GetSourceSymbol(),
                     PairTag = NormalizedPairTag(),
+                    SourceAccount = GetSourceAccount(),
                     AtasTimestampUtc = DateTimeOffset.UtcNow.ToString("O"),
                     LocalMonotonicTicks = Stopwatch.GetTimestamp(),
                     LocalStopwatchFrequency = Stopwatch.Frequency,
@@ -588,22 +604,84 @@ namespace AtasMt5ProbeStrategy
 
         private string GetSourceSymbol()
         {
-            return string.IsNullOrWhiteSpace(SourceSymbolOverride)
-                ? Security?.ToString() ?? ""
-                : SourceSymbolOverride.Trim();
+            if (!string.IsNullOrWhiteSpace(SourceSymbolOverride))
+            {
+                var configured = SourceSymbolOverride.Trim();
+                // Older workspaces sometimes stored the MT5 target name in
+                // this ATAS field.  Ignore those two known target aliases so
+                // an account/contract switch does not require editing the
+                // strategy settings.  Other explicit overrides remain
+                // supported for future instruments.
+                var upper = configured.ToUpperInvariant();
+                if (upper != "XAUUSD" && upper != "USTEC")
+                    return CanonicalizeSourceSymbol(configured);
+            }
+
+            return CanonicalizeSourceSymbol(Security?.ToString() ?? "");
+        }
+
+        private string GetSourceAccount()
+        {
+            return Portfolio?.ToString()?.Trim() ?? "";
+        }
+
+        private static string CanonicalizeSourceSymbol(string value)
+        {
+            var text = value?.Trim() ?? "";
+            if (text.Length == 0)
+                return text;
+
+            var upper = text.ToUpperInvariant();
+            var compact = new string(upper.Where(char.IsLetterOrDigit).ToArray());
+            if (upper.Contains("GOLD", StringComparison.Ordinal)
+                || upper == "GC"
+                || compact.StartsWith("GC", StringComparison.Ordinal))
+                return "GC";
+
+            if (upper.Contains("NASDAQ", StringComparison.Ordinal)
+                || upper == "NQ"
+                || compact.StartsWith("NQ", StringComparison.Ordinal))
+                return "NQ";
+
+            // Unknown instruments remain explicit instead of being guessed
+            // into one of the two configured live pairs.
+            return text;
         }
 
         private string NormalizedPairTag()
         {
-            return PairTag?.Trim() ?? "";
+            var configured = PairTag?.Trim() ?? "";
+            if (configured.Length > 0)
+                return configured;
+
+            // The bridge currently owns these two continuous-contract
+            // families.  Derive their transport route from the chart so a
+            // saved workspace remains valid after an upgrade or roll-over.
+            return GetSourceSymbol().ToUpperInvariant() switch
+            {
+                "GC" => "gc_xauusd",
+                "NQ" => "nq_ustec",
+                _ => "",
+            };
         }
 
         private bool IsCurrentChartSecurity(string? securityId)
         {
-            return string.Equals(
-                securityId?.Trim(),
-                Security?.ToString()?.Trim(),
-                StringComparison.OrdinalIgnoreCase);
+            var observed = securityId?.Trim() ?? "";
+            var chart = Security?.ToString()?.Trim() ?? "";
+            if (string.Equals(observed, chart, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            // ATAS may expose the chart as a continuous instrument (for
+            // example, "COMEX Gold Futures") while order callbacks carry the
+            // currently rolled contract ("GCZ6@COMEX").  Match known source
+            // families after canonicalisation, but retain exact matching for
+            // every unknown instrument so symbols never bleed across pairs.
+            var observedCanonical = CanonicalizeSourceSymbol(observed);
+            var chartCanonical = CanonicalizeSourceSymbol(chart);
+            return !string.IsNullOrWhiteSpace(observedCanonical)
+                && string.Equals(observedCanonical, chartCanonical, StringComparison.OrdinalIgnoreCase)
+                && (observedCanonical == "GC" || observedCanonical == "NQ");
         }
 
         private string NormalizedDeliveryMode()

@@ -30,6 +30,12 @@ namespace AtasMt5ProbeStrategy
         [JsonProperty("pair_tag")]
         public string PairTag { get; set; } = "";
 
+        // Portfolio/connector identity is diagnostic and is used by the
+        // bridge to recognize an account switch.  It is deliberately not a
+        // credential; ATAS supplies only its display identity.
+        [JsonProperty("source_account")]
+        public string SourceAccount { get; set; } = "";
+
         [JsonProperty("atas_timestamp_utc")]
         public string AtasTimestampUtc { get; set; } = "";
 

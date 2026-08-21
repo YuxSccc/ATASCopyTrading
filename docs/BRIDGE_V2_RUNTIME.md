@@ -12,8 +12,11 @@ account credentials, and cannot submit an MT5 order.
 
 ## Run the simulator
 
-Use the exact value emitted by the probe's `source_symbol`; set the strategy's
-`Source symbol override` to `GC` first if you want a stable short symbol.
+For GC and NQ, the current probe emits stable logical names automatically even
+when ATAS rolls the contract month or changes the connector display text. No
+`Source symbol override` or `PairTag` is required. The Python router also
+accepts legacy display names such as `COMEX Gold Futures` and `E-mini
+NASDAQ-100 September 2026` during migration.
 
 ```powershell
 $env:PYTHONPATH = "src"

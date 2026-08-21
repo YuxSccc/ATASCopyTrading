@@ -32,6 +32,9 @@ def source_state_to_data(state: SourceSymbolState) -> dict[str, Any]:
         "synchronized": state.synchronized,
         "quote": _quote_to_data(state.quote),
         "position_complete": state.position_complete,
+        "source_account": state.source_account,
+        "orders_complete": state.orders_complete,
+        "explicitly_removed_order_ids": sorted(state.explicitly_removed_order_ids),
     }
 
 
@@ -46,6 +49,12 @@ def source_state_from_data(data: Mapping[str, Any]) -> SourceSymbolState:
         synchronized=bool(data["synchronized"]),
         quote=_quote_from_data(data.get("quote")),
         position_complete=bool(data.get("position_complete", data.get("position") is not None)),
+        source_account=str(data.get("source_account", "")).strip(),
+        # Checkpoints produced before order-inventory provenance existed are
+        # deliberately treated as incomplete.  The safer failure mode is to
+        # preserve target orders/protection until ATAS proves their removal.
+        orders_complete=bool(data.get("orders_complete", False)),
+        explicitly_removed_order_ids=frozenset(str(item) for item in data.get("explicitly_removed_order_ids", []) if str(item)),
     )
 
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,10 +17,11 @@ from .atas_adapter import parse_probe_message
 from .coordinator import SymbolCoordinator
 from .journal import JsonlOperationJournal
 from .mt5_gateway import Mt5HttpGateway, command_to_tsv
-from .models import ExecutionReceipt, OperationStatus
+from .models import BridgeCommand, CommandType, ExecutionReceipt, IntentState, OperationStatus, TargetLegState
 from .persistence import SqliteBridgeStateStore
 from .policy import AtasAuthoritativePolicy
 from .pricing import PriceGuardConfig, PriceMapper
+from .symbol_aliases import source_symbol_matches
 from .test_control import DemoTestController
 
 
@@ -72,15 +73,6 @@ class LiveBridgeController:
         for record in self.coordinator.operation_book.records.values():
             if record.resolved_at_utc is None:
                 self.gateway.remember_quarantined_command(record.command)
-            # Recovery permits a late EA receipt, but never re-offers an
-            # ambiguous request after a process restart. A timeout is not
-            # proof that MT5 did not receive the original command.
-            if record.resolved_at_utc is None and record.status in {
-                OperationStatus.PENDING,
-                OperationStatus.ACCEPTED,
-                OperationStatus.CONFIRMED,
-            }:
-                self.gateway.restore_unresolved_command(record.command)
             elif record.resolved_at_utc is not None:
                 # A lost HTTP response can make an EA resend an old receipt.
                 # Treat it as idempotent without reopening the completed op.
@@ -99,6 +91,12 @@ class LiveBridgeController:
 
     def handle_atas_message(self, payload: Mapping[str, Any]) -> None:
         with self._lock:
+            # ATAS' display/security text changes with connector, contract
+            # month and account.  Pair routing has already selected this
+            # runtime (by tag or alias); normalize the envelope before the
+            # canonical v2 parser sees it so a new Rithmic account cannot
+            # create a second logical source symbol.
+            payload = self._normalize_atas_payload(payload)
             if _is_basis_collector_event(payload):
                 if _is_embedded_basis_event(payload):
                     # Embedded basis events use the Probe's source sequence;
@@ -118,6 +116,24 @@ class LiveBridgeController:
             self.coordinator.handle(event)
             if self.test_controller is not None:
                 self.test_controller.observe_probe_event(payload)
+
+    def _normalize_atas_payload(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Replace a connector display name with this runtime's source key.
+
+        The original nested security text remains available in the raw JSONL
+        recorder.  The v2 domain only needs the stable configured key for
+        state-book and intent-ledger identity.  A shallow copy keeps caller
+        payloads immutable and avoids mutating the recorder's object.
+        """
+
+        raw_symbol = str(payload.get("source_symbol", "")).strip()
+        if not raw_symbol or raw_symbol.casefold() == self.source_symbol.strip().casefold():
+            return payload
+        # A supplied PairTag is authoritative for an unknown display name;
+        # for known aliases the router has already verified the same runtime.
+        # This also lets a future connector provide a new display name before
+        # its alias is added.
+        return {**payload, "source_symbol": self.source_symbol}
 
     def handle_mt5_snapshot(self, payload: Mapping[str, Any]) -> None:
         with self._lock:
@@ -235,6 +251,11 @@ class LiveBridgeController:
         with self._lock:
             receipt = self.gateway.acknowledge_command(payload)
             self.coordinator.handle_target_receipt(receipt)
+            # A receipt with a concrete MT5 pending-order ticket can make a
+            # source cancellation dispatchable before the next full account
+            # snapshot.  Re-plan now; the coordinator still permits only the
+            # risk-reducing cancellation while another operation is in flight.
+            self.coordinator.handle_target_observation()
 
     def confirm_no_effect_after_operator_check(self, command_id: str) -> None:
         with self._lock:
@@ -254,6 +275,7 @@ class LiveBridgeController:
             return {
                 "pair_tag": self.pair_tag,
                 "source_symbol": self.source_symbol,
+                "source_account": source_state.source_account if source_state is not None else "",
                 "target_symbol": self.target_symbol,
                 "bridge_magic": self.bridge_magic,
                 "volume_multiplier": str(self.volume_multiplier),
@@ -296,8 +318,52 @@ class LiveBridgeController:
             return self._next_mt5_command_locked()
 
     def _next_mt5_command_locked(self) -> str:
-        commands = self.gateway.next_commands(limit=1)
-        return command_to_tsv(commands[0]) if commands else ""
+        # A durable local queue is intentionally at-least-once, but a source
+        # cancellation can arrive before its earlier create is polled by the
+        # EA.  Never let such a superseded create turn into a delayed MT5
+        # pending order.  We only discard commands that the gateway proves
+        # were *not yet offered*; offered commands remain conservative and
+        # go through ordinary receipt/snapshot reconciliation.
+        while True:
+            candidate = self.gateway.next_queued_command()
+            if candidate is None:
+                return ""
+            if self._command_is_still_deliverable(candidate):
+                commands = self.gateway.next_commands(limit=1)
+                return command_to_tsv(commands[0]) if commands else ""
+            if not self.gateway.discard_undelivered_command(candidate.command_id):
+                return ""
+            discarded = self.coordinator.operation_book.discard_before_delivery(candidate.command_id)
+            if candidate.leg_id is not None:
+                leg = self.coordinator.ledger.get_leg(candidate.leg_id)
+                if leg is not None and leg.state == TargetLegState.CREATE_PENDING:
+                    self.coordinator.ledger.update_leg(replace(leg, state=TargetLegState.CANCELLED))
+            self.coordinator.state_store.save_ledger_and_operations(
+                self.target_symbol,
+                self.coordinator.ledger,
+                (discarded,),
+            )
+
+    def _command_is_still_deliverable(self, command: BridgeCommand) -> bool:
+        """Validate delayed queue entries against the newest ATAS intent."""
+
+        if command.command_type != CommandType.CREATE_PENDING:
+            return True
+        if command.intent_id is None or command.leg_id is None or command.source_order_id is None:
+            return False
+        intent = self.coordinator.ledger.intents.get(command.intent_id)
+        leg = self.coordinator.ledger.get_leg(command.leg_id)
+        if intent is None or leg is None or intent.state != IntentState.ACTIVE:
+            return False
+        if leg.state != TargetLegState.CREATE_PENDING:
+            return False
+        if not self.coordinator.source_book.has_synchronized_snapshot:
+            return False
+        source = self.coordinator.source_book.snapshot()
+        return (
+            intent.source_key.session_id == source.session_id
+            and command.source_order_id in source.active_orders
+        )
 
 
 @dataclass
@@ -327,11 +393,31 @@ class PairRoutedBridgeController:
             runtime = self.runtimes.get(_pair_key(supplied))
             if runtime is None:
                 raise ValueError(f"unknown pair_tag: {supplied}")
+            if kind == "atas":
+                # A stale tag must never silently send a recognizable source
+                # instrument to another pair.  If the display name resolves
+                # uniquely, require it to agree with the supplied tag; an
+                # unknown future display name may still use the explicit tag
+                # while the alias table is being extended.
+                value = str(payload.get("source_symbol", "")).strip()
+                candidates = [
+                    item
+                    for item in self.runtimes.values()
+                    if source_symbol_matches(item.source_symbol, value)
+                ]
+                if len(candidates) == 1 and candidates[0] is not runtime:
+                    raise ValueError(
+                        f"pair_tag/source_symbol conflict: {supplied}/{value}"
+                    )
             return runtime
 
         if kind == "atas":
-            value = str(payload.get("source_symbol", "")).strip().lower()
-            candidates = [item for item in self.runtimes.values() if item.source_symbol.strip().lower() == value]
+            value = str(payload.get("source_symbol", "")).strip()
+            candidates = [
+                item
+                for item in self.runtimes.values()
+                if source_symbol_matches(item.source_symbol, value)
+            ]
         elif kind == "mt5":
             symbol = str(payload.get("target_symbol", "")).strip().lower()
             try:
@@ -672,7 +758,7 @@ def main() -> int:
     parser.add_argument("--basis-half-life-seconds", type=int, default=15 * 60)
     parser.add_argument("--basis-sample-interval-seconds", type=int, default=60)
     parser.add_argument("--basis-minimum-samples", type=int, default=170)
-    parser.add_argument("--quote-max-age-ms", type=int, default=250)
+    parser.add_argument("--quote-max-age-ms", type=int, default=3000)
     parser.add_argument("--max-current-basis-deviation", type=Decimal, default=Decimal("2.00"))
     parser.add_argument("--max-basis-dispersion", type=Decimal, default=Decimal("1.00"))
     parser.add_argument("--enable-execution", action="store_true")

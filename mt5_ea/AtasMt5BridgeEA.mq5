@@ -1,5 +1,5 @@
 #property strict
-#property version   "0.103"
+#property version   "0.105"
 #property description "Local ATAS-to-MT5 bridge observer and guarded command executor."
 
 input string BridgeBaseUrl = "http://127.0.0.1:8768";
@@ -10,7 +10,7 @@ input bool EnableExecution = false;
 // are pushed on trade transactions and periodically for recovery, rather
 // than being rebuilt on every poll tick.
 input int SnapshotIntervalMilliseconds = 50;
-input int FullSnapshotIntervalMilliseconds = 5000;
+input int FullSnapshotIntervalMilliseconds = 250;
 input int HttpTimeoutMilliseconds = 1000;
 
 ulong g_last_snapshot_tick = 0;
@@ -113,7 +113,7 @@ bool PublishHeartbeat(string &command_response)
    SymbolInfoTick(_Symbol, tick);
    string body = StringFormat(
       "{\"target_symbol\":\"%s\",\"pair_tag\":\"%s\",\"bridge_magic\":%I64d,\"quote\":{\"bid\":\"%s\",\"ask\":\"%s\",\"occurred_at_utc\":\"%s\"}}",
-      EscapeJson(_Symbol), EscapeJson(PairTag), BridgeMagic, Number(tick.bid), Number(tick.ask), UtcIso(TimeGMT()));
+      EscapeJson(_Symbol), EscapeJson(ResolvedPairTag()), BridgeMagic, Number(tick.bid), Number(tick.ask), UtcIso(TimeGMT()));
    string response;
    int status = 0;
    if(!Http("POST", "/v1/mt5/heartbeat?poll=1", body, response, status))
@@ -204,7 +204,7 @@ string BuildSnapshotJson(bool include_history)
       "\"long_quantity\":\"%s\",\"short_quantity\":\"%s\",\"quote\":{\"bid\":\"%s\",\"ask\":\"%s\",\"occurred_at_utc\":\"%s\"},"
       "\"symbol_spec\":{\"tick_size\":\"%s\",\"volume_min\":\"%s\",\"volume_max\":\"%s\",\"volume_step\":\"%s\",\"stops_level\":\"%s\",\"freeze_level\":\"%s\"},"
       "\"pending_orders\":[%s],\"positions\":[%s],\"foreign_symbol_objects_present\":%s}",
-      EscapeJson(_Symbol), EscapeJson(PairTag), BridgeMagic, account_model, history, Number(long_volume), Number(short_volume),
+      EscapeJson(_Symbol), EscapeJson(ResolvedPairTag()), BridgeMagic, account_model, history, Number(long_volume), Number(short_volume),
       Number(tick.bid), Number(tick.ask), UtcIso(TimeGMT()),
       Number(SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE)), Number(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN)),
       Number(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX)), Number(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP)),
@@ -346,12 +346,37 @@ void ExecuteCommand(string &fields[])
       SendReceipt(command_id, "failed", "", "cannot persist EA command state before dispatch");
       return;
    }
-   if(!OrderSendAsync(request, result))
+   // A pending-order create must return its broker-assigned ticket.  The old
+   // asynchronous call commonly returned order=0, leaving the bridge unable
+   // to cancel an ATAS order which was withdrawn before the next full MT5
+   // snapshot.  OrderSend waits only for this command's broker response and
+   // preserves the low-frequency full snapshot as confirmation/audit.
+   ResetLastError();
+   if(!OrderSend(request, result))
    {
-      CompleteCommand(command_id, "failed", "", StringFormat("OrderSendAsync failed, error=%d", GetLastError()));
+      CompleteCommand(command_id, "failed", "", StringFormat("OrderSend failed, error=%d", GetLastError()));
       return;
    }
-   CompleteCommand(command_id, "accepted", StringFormat("%I64u", result.order), "request sent to MT5 trade server");
+   if(!IsAcceptedTradeRetcode(result.retcode))
+   {
+      CompleteCommand(command_id, "failed", "", StringFormat("MT5 rejected command, retcode=%u: %s", result.retcode, result.comment));
+      return;
+   }
+   string target_reference = "";
+   if(command_type == "create_pending")
+      target_reference = StringFormat("%I64u", result.order);
+   else if(command_type == "cancel_pending")
+      target_reference = fields[9];
+   else if(command_type == "close_position" || command_type == "modify_position_protection")
+      target_reference = fields[8];
+   CompleteCommand(command_id, "accepted", target_reference, StringFormat("MT5 accepted request, retcode=%u", result.retcode));
+}
+
+bool IsAcceptedTradeRetcode(uint retcode)
+{
+   return retcode == TRADE_RETCODE_DONE ||
+          retcode == TRADE_RETCODE_PLACED ||
+          retcode == TRADE_RETCODE_DONE_PARTIAL;
 }
 
 ENUM_ORDER_TYPE PendingType(string side, string order_type)
@@ -377,7 +402,7 @@ ENUM_ORDER_TYPE_FILLING ResolveFillingMode()
 void SendReceipt(string command_id, string status_text, string target_reference, string message)
 {
    g_pending_receipt_body = StringFormat("{\"command_id\":\"%s\",\"pair_tag\":\"%s\",\"status\":\"%s\",\"target_reference\":\"%s\",\"message\":\"%s\"}",
-                                         EscapeJson(command_id), EscapeJson(PairTag), EscapeJson(status_text), EscapeJson(target_reference), EscapeJson(message));
+                                         EscapeJson(command_id), EscapeJson(ResolvedPairTag()), EscapeJson(status_text), EscapeJson(target_reference), EscapeJson(message));
    FlushPendingReceipt();
 }
 
@@ -434,7 +459,24 @@ bool SaveCommandState(string command_id, string phase, string target_reference)
 
 string CommandStateFileName()
 {
-   return StringFormat("AtasMt5BridgeEA-%I64d-%s-%s.state", BridgeMagic, StateComponent(_Symbol), StateComponent(PairTag));
+   return StringFormat("AtasMt5BridgeEA-%I64d-%s-%s.state", BridgeMagic, StateComponent(_Symbol), StateComponent(ResolvedPairTag()));
+}
+
+string ResolvedPairTag()
+{
+   string configured = PairTag;
+   StringTrimLeft(configured);
+   StringTrimRight(configured);
+   if(StringLen(configured) > 0)
+      return configured;
+
+   string symbol = _Symbol;
+   StringToUpper(symbol);
+   if(StringFind(symbol, "XAUUSD") >= 0)
+      return "gc_xauusd";
+   if(StringFind(symbol, "USTEC") >= 0)
+      return "nq_ustec";
+   return "";
 }
 
 string StateComponent(string value)

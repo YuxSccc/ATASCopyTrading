@@ -9,9 +9,10 @@ demo account.
 
 The service supports multiple ATAS-to-MT5 symbol pairs through one WebSocket
 port (`8767`) and one HTTP port (`8768`). Each pair has an independent
-coordinator, gateway, basis calibration, and durable state. Use a stable
-`PairTag` in the ATAS probe and MT5 EA; during migration, a missing tag is
-routed only when source symbol or target symbol plus magic is unique.
+coordinator, gateway, basis calibration, and durable state. `PairTag` is
+optional for the built-in GC/NQ mapping: the probe and router normalize ATAS
+contract/display names, while MT5 falls back to unique target symbol plus
+magic. Use a tag when adding a third instrument.
 
 ```text
 ATAS strategies (one WebSocket, :8767)
@@ -32,9 +33,9 @@ number, the bridge quarantines the symbol and submits nothing.
    each exact target-symbol chart (for example `XAUUSD` and `USTEC`; broker
    suffixes must match the service configuration). In the EA settings, add
    `http://127.0.0.1:8768` to MT5's allowed WebRequest URLs.
-2. Set `PairTag` to the same value on the matching ATAS probe and MT5 EA. The
-   field is optional during migration; the service has a unique-symbol/magic
-   fallback. Use distinct magic numbers when possible.
+2. For GC/NQ, leave the probe's `Source symbol override` and `PairTag` blank;
+   the service maps `GC -> XAUUSD` and `NQ -> USTEC` automatically. A tag may
+   still be set identically on both ends for a future additional instrument.
 3. Start one service for all pairs. Each `--pair` is
    `TAG=ATAS_SOURCE:MT5_TARGET:MAGIC:MULTIPLIER`, where `MULTIPLIER` is
    target lots per one ATAS lot:

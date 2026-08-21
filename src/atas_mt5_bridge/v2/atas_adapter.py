@@ -23,6 +23,7 @@ def parse_probe_message(message: Mapping[str, Any]) -> SourceEvent:
         "event_id": int(message["event_id"]),
         "source_symbol": _required_text(message, "source_symbol"),
         "occurred_at_utc": _required_text(message, "atas_timestamp_utc"),
+        "source_account": str(message.get("source_account", "")).strip(),
     }
     if event_type in {"order_new", "order_changed"}:
         return SourceEvent(event_type=SourceEventType.ORDER, order=_parse_order(data), **common)

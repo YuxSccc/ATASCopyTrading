@@ -16,6 +16,7 @@ from atas_mt5_bridge.v2.live_service import (
     _merge_minute_bars,
     start_mt5_http_server,
 )
+from atas_mt5_bridge.v2.symbol_aliases import canonical_source_symbol, source_symbol_matches
 
 
 def test_pair_spec_parses_individual_volume_multipliers():
@@ -29,6 +30,72 @@ def test_pair_spec_parses_individual_volume_multipliers():
     specs = _parse_pair_specs(args)
     assert specs[0][-1] == Decimal("0.05")
     assert specs[1][-1] == Decimal("0.5")
+
+
+def test_source_aliases_cover_connector_and_contract_display_names():
+    assert canonical_source_symbol("COMEX Gold Futures") == "GC"
+    assert canonical_source_symbol("COMEX Gold December 2026") == "GC"
+    assert canonical_source_symbol("GCZ6@COMEX") == "GC"
+    assert canonical_source_symbol("GCG7@COMEX") == "GC"
+    assert canonical_source_symbol("E-mini NASDAQ-100 September 2026") == "NQ"
+    assert canonical_source_symbol("NQH7@CME") == "NQ"
+    assert canonical_source_symbol("NQ") == "NQ"
+    assert source_symbol_matches("GC", "COMEX Gold Futures")
+    assert not source_symbol_matches("NQ", "USTEC")
+    assert not source_symbol_matches("GC", "E-mini NASDAQ-100 September 2026")
+
+
+def test_atas_display_names_route_without_pair_tag_and_are_normalized(tmp_path: Path):
+    gc = LiveBridgeController(
+        source_symbol="GC",
+        target_symbol="XAUUSD",
+        bridge_magic=26081001,
+        pair_tag="gc_xauusd",
+        database_path=tmp_path / "state.db",
+        journal_path=tmp_path / "ops.jsonl",
+    )
+    nq = LiveBridgeController(
+        source_symbol="NQ",
+        target_symbol="USTEC",
+        bridge_magic=26081001,
+        pair_tag="nq_ustec",
+        database_path=tmp_path / "state.db",
+        journal_path=tmp_path / "ops.jsonl",
+    )
+    controller = PairRoutedBridgeController({"gc_xauusd": gc, "nq_ustec": nq})
+    try:
+        def snapshot_event(source_symbol: str, session_id: str) -> dict:
+            return {
+                "session_id": session_id,
+                "event_id": 1,
+                "event_type": "state_snapshot",
+                "source_symbol": source_symbol,
+                "pair_tag": "",
+                "atas_timestamp_utc": "2026-08-21T10:00:00Z",
+                "data": {
+                    "position_known": True,
+                    "last_observed_position": {"security": source_symbol, "volume": "0", "average_price": "0"},
+                    "orders": [],
+                    "orders_complete": True,
+                },
+            }
+
+        controller.handle_atas_message(snapshot_event("COMEX Gold Futures", "gc-session"))
+        controller.handle_atas_message(snapshot_event("E-mini NASDAQ-100 September 2026", "nq-session"))
+        with pytest.raises(ValueError, match="pair_tag/source_symbol conflict"):
+            controller.handle_atas_message(
+                {
+                    **snapshot_event("E-mini NASDAQ-100 September 2026", "nq-session-2"),
+                    "pair_tag": "gc_xauusd",
+                }
+            )
+        status = controller.status()
+        assert status["pairs"]["gc_xauusd"]["source_synchronized"] is True
+        assert status["pairs"]["nq_ustec"]["source_synchronized"] is True
+        assert status["pairs"]["gc_xauusd"]["source_symbol"] == "GC"
+        assert status["pairs"]["nq_ustec"]["source_symbol"] == "NQ"
+    finally:
+        controller.close()
 from atas_mt5_bridge.v2.test_control import DemoTestController
 from atas_mt5_bridge.v2.mt5_gateway import Mt5GatewayError, Mt5HttpGateway, command_to_tsv
 
@@ -269,6 +336,20 @@ def test_gateway_quarantines_expired_command_without_rejecting_a_late_receipt():
     assert gateway.acknowledge_command(
         {"command_id": command().command_id, "status": "unknown", "target_reference": ""}
     ).status == OperationStatus.UNKNOWN
+
+
+def test_gateway_can_discard_a_superseded_command_only_before_ea_offer():
+    gateway = Mt5HttpGateway("XAUUSD", 26081001)
+    gateway.ingest_snapshot(snapshot())
+    gateway.execute(command())
+
+    assert gateway.next_queued_command() == command()
+    assert gateway.discard_undelivered_command(command().command_id) is True
+    assert gateway.next_commands() == ()
+
+    gateway.execute(command())
+    assert gateway.next_commands() == (command(),)
+    assert gateway.discard_undelivered_command(command().command_id) is False
 
 
 def test_live_controller_caches_mt5_state_before_atas_snapshot_without_planning(tmp_path: Path):

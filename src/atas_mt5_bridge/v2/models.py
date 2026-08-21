@@ -50,6 +50,7 @@ class SequenceStatus(str, Enum):
     GAP_DETECTED = "gap_detected"
     SNAPSHOT_REQUIRED = "snapshot_required"
     SESSION_RESET = "session_reset"
+    ACCOUNT_RESET = "account_reset"
 
 
 class IntentState(str, Enum):
@@ -134,6 +135,7 @@ class SourceEvent:
     event_type: SourceEventType
     source_symbol: str
     occurred_at_utc: str
+    source_account: str = ""
     order: SourceOrder | None = None
     position: SourcePosition | None = None
     quote: SourceQuote | None = None
@@ -168,6 +170,21 @@ class SourceSymbolState:
     synchronized: bool
     quote: SourceQuote | None = None
     position_complete: bool = False
+    source_account: str = ""
+    # ``False`` means ATAS has only provided callback-derived order events.
+    # In particular, a ChartStrategy restart cannot enumerate manually placed
+    # chart orders.  Absence from ``active_orders`` must therefore not be
+    # interpreted as a cancellation while this flag is false.
+    orders_complete: bool = False
+    # Order ids removed by an explicit ATAS callback.  This is deliberately
+    # separate from an absent order in an incomplete recovery snapshot.
+    explicitly_removed_order_ids: frozenset[str] = frozenset()
+    # Orders which this running bridge process has observed as active through
+    # a direct callback (or a genuinely complete ATAS inventory).  Persisted
+    # callback state is useful to avoid blind target cancellation after a
+    # restart, but is never sufficient authority to create a fresh target
+    # pending order again.
+    dispatchable_order_ids: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)

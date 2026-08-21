@@ -44,6 +44,14 @@ WebSocket server receive time (UTC and monotonic)
 optional acknowledgement round-trip time in ATAS StrategyLog
 ```
 
+The probe now emits a stable logical source name automatically for the two
+configured futures: all GC contract/display names become `GC`, and all NQ
+contract/display names become `NQ`. Leave `Source symbol override` and
+`Pair tag` blank for those instruments. The raw nested `security` value is
+still retained in the event for contract-roll diagnostics. A connector
+portfolio display identity is also emitted as `source_account`; a changed
+identity forces the bridge to wait for a fresh snapshot before planning.
+
 `async` delivery sends immediately and does not wait for the acknowledgement.
 `sync` delivery still returns from the ATAS callback immediately, but its
 background sender waits for the matching acknowledgement and logs its round-trip
@@ -62,7 +70,7 @@ $env:ATAS_HOME = "C:\Program Files (x86)\ATAS Platform"
 dotnet build -c Release
 ```
 
-Copy `atas_probe\bin\Release\netstandard2.1\AtasMt5ProbeStrategy.dll` to
+Copy `atas_probe\bin\Release\net10.0\AtasMt5ProbeStrategy.dll` to
 `%APPDATA%\ATAS\Strategies\`, restart ATAS, then right-click the target chart
 and choose **Chart Strategies**. In the strategy list, select
 `AtasMt5BridgeProbe` and click **Add**. Do not install this DLL in the

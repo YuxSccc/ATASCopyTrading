@@ -93,3 +93,24 @@ See `docs/BRIDGE_V2_RUNTIME.md` to run the safe simulator with the existing
 ATAS probe. See `docs/LIVE_BRIDGE_SETUP.md` for the deliberately gated MT5 EA
 installation, operation state machine, recovery protocol, and first-live-test
 checklist.
+
+## One-click live bridge startup
+
+The project root contains `start_bridge.cmd` (or `start_bridge.ps1`). It starts
+the current two-pair configuration without retyping the long command line:
+
+```powershell
+.\start_bridge.cmd
+```
+
+The default shortcut enables Python-side execution for the demo configuration
+and keeps the local test-control endpoint enabled. The EA `EnableExecution`
+switch is still an independent gate. For observation-only startup, use:
+
+```powershell
+.\start_bridge.ps1 -ObserveOnly
+```
+
+The script refuses to start a second service while ports 8767 or 8768 are
+already listening. Stopping the bridge process does not close existing MT5
+positions or pending orders.

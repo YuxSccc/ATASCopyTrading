@@ -170,6 +170,33 @@ class Mt5HttpGateway(TargetExecutionPort):
                 timing["offer_count"] = int(timing.get("offer_count", 0)) + 1
             return commands
 
+    def next_queued_command(self) -> BridgeCommand | None:
+        """Return the next command without exposing it to the MT5 EA."""
+
+        with self._lock:
+            if not self._transport_is_fresh_locked():
+                return None
+            return next(iter(self._queued_commands.values()), None)
+
+    def discard_undelivered_command(self, command_id: str) -> bool:
+        """Remove a queued command only if no EA poll has received it.
+
+        Once a command has been offered, a missing receipt is ambiguous and
+        must continue through the normal durable reconciliation path.  This
+        distinction is what lets a later ATAS cancellation invalidate a
+        queued create without risking a duplicate broker request.
+        """
+
+        with self._lock:
+            if command_id not in self._queued_commands:
+                return False
+            timing = self._transport_times.get(command_id, {})
+            if "offered_monotonic" in timing:
+                return False
+            self._queued_commands.pop(command_id, None)
+            self._transport_times.pop(command_id, None)
+            return True
+
     def transport_status(self) -> dict[str, object]:
         """Return the latest local queue/EA receipt timing for diagnostics.
 

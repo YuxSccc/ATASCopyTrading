@@ -58,13 +58,36 @@ class IntentLedger:
             else:
                 self.intents[intent_id] = replace(existing, order=order, state=IntentState.ACTIVE)
 
-        # A full source state is authoritative. Any previously active source
-        # instance absent from it has been cancelled, filled, or otherwise retired.
+        # An absent order is a cancellation only when ATAS supplied a complete
+        # inventory.  ChartStrategy recovery snapshots intentionally mark
+        # manually-entered orders as incomplete; retiring their target legs on
+        # a reconnect would incorrectly cancel live MT5 entries or clear
+        # protection.  An explicit callback remains authoritative for that
+        # individual source order even with an incomplete inventory.
         for intent_id, intent in tuple(self.intents.items()):
             if intent.state != IntentState.ACTIVE:
                 continue
-            if intent.source_key.session_id != source.session_id or intent_id not in active_intent_ids:
+            # ATAS order ids identify the broker order instance and survive a
+            # probe-session restart.  A directly observed cancellation may
+            # therefore retire the pre-reconnect mapping as well.
+            was_explicitly_removed = intent.source_key.source_order_id in source.explicitly_removed_order_ids
+            absent_from_complete_inventory = source.orders_complete and intent_id not in active_intent_ids
+            if was_explicitly_removed or absent_from_complete_inventory:
                 self.intents[intent_id] = replace(intent, state=IntentState.RETIRED)
+
+        # A missing target leg has already been proved absent by a *complete*
+        # MT5 snapshot.  It must not indefinitely quarantine a new ATAS probe
+        # session merely because the old session could not enumerate every
+        # historic source order during reconnect.  There is no target-side
+        # risk left to reconcile in this case, so retain the audit record but
+        # close the stale leg.  Live ACTIVE/PARTIAL legs are intentionally not
+        # touched here: an incomplete ATAS inventory must never cancel them.
+        for leg_id, leg in tuple(self.legs.items()):
+            if (
+                leg.state == TargetLegState.MISSING_ON_TARGET
+                and leg.source_key.session_id != source.session_id
+            ):
+                self.legs[leg_id] = replace(leg, state=TargetLegState.CANCELLED, target_order_ticket=None)
 
     def ensure_legs(self, intent_id: str, specs: Iterable[TargetLegSpec]) -> tuple[TargetLeg, ...]:
         """Return the live layout, preserving cancelled legs as audit history.
@@ -181,7 +204,17 @@ class IntentLedger:
         for leg_id, leg in tuple(self.legs.items()):
             order = orders_by_leg_id.get(leg_id)
             if order is not None:
-                state = TargetLegState.PARTIAL_FILL if order.quantity < leg.quantity else TargetLegState.ACTIVE
+                # A complete MT5 snapshot may still contain an order while a
+                # just-submitted cancellation is in flight.  Preserve that
+                # state so the policy does not issue duplicate cancellations
+                # on each following snapshot.
+                state = (
+                    TargetLegState.CANCEL_PENDING
+                    if leg.state == TargetLegState.CANCEL_PENDING
+                    else TargetLegState.PARTIAL_FILL
+                    if order.quantity < leg.quantity
+                    else TargetLegState.ACTIVE
+                )
                 self.legs[leg_id] = replace(
                     leg,
                     state=state,

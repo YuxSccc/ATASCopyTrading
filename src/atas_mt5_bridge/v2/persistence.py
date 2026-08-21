@@ -131,6 +131,7 @@ class SqliteBridgeStateStore:
             "event_id": event.event_id,
             "event_type": event.event_type.value,
             "source_symbol": event.source_symbol,
+            "source_account": event.source_account,
             "occurred_at_utc": event.occurred_at_utc,
         }
         with self._transaction() as connection:

@@ -58,6 +58,13 @@ class AtasAuthoritativePolicy:
                     ledger.update_leg(_with_state(leg, TargetLegState.CANCELLED))
                 elif leg.state == TargetLegState.ACTIVE:
                     commands.append(self._cancel_command(source, target, leg))
+                elif leg.state == TargetLegState.CREATE_PENDING and leg.target_order_ticket is not None:
+                    # The EA has synchronously accepted the pending order and
+                    # returned its MT5 ticket, but the next full snapshot has
+                    # not arrived yet.  A later ATAS cancellation must be
+                    # able to remove that exact order immediately rather than
+                    # waiting for recovery polling.
+                    commands.append(self._cancel_command(source, target, leg))
 
         # The user elected an aggressive partial-fill rule: any target order
         # with a reduced remaining volume is treated as asymmetric execution.
@@ -77,6 +84,15 @@ class AtasAuthoritativePolicy:
 
         if self.direct_pending_enabled:
             for intent in ledger.active_intents():
+                # A reconnect with an incomplete ATAS order inventory must not
+                # replay a pending order from an earlier probe session.  It is
+                # retained in the ledger only to preserve its existing MT5
+                # mapping until ATAS can explicitly cancel or fully enumerate
+                # it.
+                if intent.source_key.session_id != source.session_id:
+                    continue
+                if intent.order.source_order_id not in source.dispatchable_order_ids:
+                    continue
                 if _role_for_source_order(intent.order.comment) in {
                     TargetLegRole.PROTECTIVE_TP,
                     TargetLegRole.PROTECTIVE_SL,
@@ -253,8 +269,18 @@ class AtasAuthoritativePolicy:
         if any(position.side.lower() != expected_side for position in target.positions):
             return ()
 
-        tp_orders = tuple(order for order in source.active_orders.values() if _role_for_source_order(order.comment) == TargetLegRole.PROTECTIVE_TP)
-        sl_orders = tuple(order for order in source.active_orders.values() if _role_for_source_order(order.comment) == TargetLegRole.PROTECTIVE_SL)
+        tp_orders = tuple(
+            order
+            for order in source.active_orders.values()
+            if order.source_order_id in source.dispatchable_order_ids
+            and _role_for_source_order(order.comment) == TargetLegRole.PROTECTIVE_TP
+        )
+        sl_orders = tuple(
+            order
+            for order in source.active_orders.values()
+            if order.source_order_id in source.dispatchable_order_ids
+            and _role_for_source_order(order.comment) == TargetLegRole.PROTECTIVE_SL
+        )
         if len(tp_orders) > 1 or len(sl_orders) > 1:
             return ()
         expected_exit_side = "sell" if expected_side == "long" else "buy"
@@ -274,13 +300,21 @@ class AtasAuthoritativePolicy:
 
         commands: list[BridgeCommand] = []
         for position in target.positions:
-            if position.stop_loss == stop_loss and position.take_profit == take_profit:
+            # A callback-derived source inventory can prove an add/move, but
+            # cannot prove that an unseen TP/SL was removed after a strategy
+            # reconnect.  Preserve the corresponding native MT5 field until
+            # ATAS sends a complete inventory or an explicit removal event.
+            desired_stop_loss = stop_loss if sl_orders or source.orders_complete else position.stop_loss
+            desired_take_profit = take_profit if tp_orders or source.orders_complete else position.take_profit
+            if not _valid_native_protection(expected_side, desired_stop_loss, desired_take_profit, target):
+                continue
+            if position.stop_loss == desired_stop_loss and position.take_profit == desired_take_profit:
                 continue
             commands.append(
                 BridgeCommand(
                     command_id=(
                         f"protection:{position.ticket}:{source.last_event_id}:"
-                        f"{_command_price(stop_loss)}:{_command_price(take_profit)}"
+                        f"{_command_price(desired_stop_loss)}:{_command_price(desired_take_profit)}"
                     ),
                     command_type=CommandType.MODIFY_POSITION_PROTECTION,
                     target_symbol=target.target_symbol,
@@ -288,8 +322,8 @@ class AtasAuthoritativePolicy:
                     source_order_id=(tp_orders[0].source_order_id if tp_orders else sl_orders[0].source_order_id if sl_orders else None),
                     payload={
                         "position_ticket": position.ticket,
-                        "stop_loss": stop_loss,
-                        "take_profit": take_profit,
+                        "stop_loss": desired_stop_loss,
+                        "take_profit": desired_take_profit,
                     },
                 )
             )

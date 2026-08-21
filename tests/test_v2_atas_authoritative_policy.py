@@ -172,6 +172,38 @@ def test_source_cancel_cancels_the_exact_target_leg_after_target_confirms_it_exi
     assert cancelled.commands[0].leg_id == leg.leg_id
 
 
+def test_pending_target_snapshot_does_not_duplicate_an_in_flight_cancel():
+    port = MutableExecutionPort(target_state())
+    coordinator = SymbolCoordinator("GC", "XAUUSD", port, policy=AtasAuthoritativePolicy(execution_enabled=True))
+    coordinator.handle(snapshot())
+    coordinator.handle(event(2, SourceEventType.ORDER, order=source_order()))
+    leg = next(iter(coordinator.ledger.legs.values()))
+    port.state = target_state(
+        pending_orders=(
+            TargetOrderState(
+                ticket="mt5-1",
+                side="sell",
+                order_type="stop",
+                quantity=Decimal("2"),
+                price=Decimal("4000"),
+                trigger_price=Decimal("4000"),
+                leg_id=leg.leg_id,
+            ),
+        )
+    )
+    coordinator.handle_target_observation()
+    cancelled_source_order = SourceOrder(
+        **{**source_order().__dict__, "state": SourceOrderState.DONE, "cancelled": True}
+    )
+
+    first = coordinator.handle(event(3, SourceEventType.ORDER, order=cancelled_source_order))
+    repeated_snapshot = coordinator.handle_target_observation()
+
+    assert [command.command_type for command in first.commands] == [CommandType.CANCEL_PENDING]
+    assert repeated_snapshot.commands == ()
+    assert coordinator.ledger.get_leg(leg.leg_id).state == TargetLegState.CANCEL_PENDING
+
+
 def test_intent_ledger_requires_leg_id_when_one_source_order_has_many_target_legs():
     ledger = IntentLedger()
     state = snapshot(orders=(source_order(),))
@@ -303,6 +335,31 @@ def test_target_observation_finishes_a_cancel_that_arrived_before_create_confirm
     assert [command.command_type for command in observed.commands] == [CommandType.CANCEL_PENDING]
 
 
+def test_source_cancel_uses_ticket_from_accepted_create_before_next_snapshot():
+    """A just-created pending order must not wait for recovery polling to cancel."""
+
+    port = MutableExecutionPort(target_state())
+    coordinator = SymbolCoordinator("GC", "XAUUSD", port, policy=AtasAuthoritativePolicy(execution_enabled=True))
+    coordinator.handle(snapshot())
+    created = coordinator.handle(event(2, SourceEventType.ORDER, order=source_order()))
+    created_command = created.commands[0]
+    leg = next(iter(coordinator.ledger.legs.values()))
+
+    # This represents the synchronous EA receipt.  MT5's cached full
+    # snapshot is deliberately still old and empty here.
+    coordinator.handle_target_receipt(
+        ExecutionReceipt(created_command.command_id, OperationStatus.ACCEPTED, target_reference="123456")
+    )
+    assert coordinator.ledger.get_leg(leg.leg_id).target_order_ticket == "123456"
+    assert coordinator.ledger.get_leg(leg.leg_id).state == TargetLegState.CREATE_PENDING
+
+    cancelled_source_order = SourceOrder(**{**source_order().__dict__, "state": SourceOrderState.DONE, "cancelled": True})
+    cancelled = coordinator.handle(event(3, SourceEventType.ORDER, order=cancelled_source_order))
+
+    assert [command.command_type for command in cancelled.commands] == [CommandType.CANCEL_PENDING]
+    assert cancelled.commands[0].payload["target_order_ticket"] == "123456"
+
+
 def test_target_partial_pending_fill_is_aggressively_cancelled_before_net_repair():
     port = MutableExecutionPort(target_state())
     coordinator = SymbolCoordinator("GC", "XAUUSD", port, policy=AtasAuthoritativePolicy(execution_enabled=True))
@@ -428,6 +485,79 @@ def test_atas_tp_sl_comments_map_to_native_mt5_position_protection_not_opposite_
         "stop_loss": Decimal("3991"),
         "take_profit": Decimal("4007"),
     }
+
+
+def test_incomplete_reconnect_snapshot_never_clears_existing_mt5_protection():
+    quote = TargetQuote("XAUUSD", Decimal("4000"), Decimal("4000.2"), "2026-08-08T00:00:00Z")
+    symbol_spec = TargetSymbolSpec(
+        tick_size=Decimal("0.1"),
+        volume_min=Decimal("1"),
+        volume_max=Decimal("100"),
+        volume_step=Decimal("1"),
+        stops_level=Decimal("0.1"),
+        freeze_level=Decimal("0.1"),
+    )
+    port = MutableExecutionPort(
+        target_state(
+            long="2",
+            positions=(TargetPositionState("long-ticket", "long", Decimal("2"), Decimal("3991"), Decimal("4007")),),
+            quote=quote,
+            symbol_spec=symbol_spec,
+        )
+    )
+    coordinator = SymbolCoordinator("GC", "XAUUSD", port, policy=AtasAuthoritativePolicy(execution_enabled=True))
+    incomplete = SourceEvent(
+        session_id="reconnected-session",
+        event_id=1,
+        event_type=SourceEventType.SNAPSHOT,
+        source_symbol="GC",
+        occurred_at_utc="2026-08-08T00:00:00Z",
+        position=SourcePosition("GC", Decimal("2"), None),
+        snapshot_orders=(),
+        snapshot_orders_complete=False,
+        position_complete=True,
+    )
+
+    result = coordinator.handle(incomplete)
+
+    assert result.commands == ()
+
+
+def test_incomplete_inventory_can_move_observed_sl_without_clearing_unseen_tp():
+    quote = TargetQuote("XAUUSD", Decimal("4000"), Decimal("4000.2"), "2026-08-08T00:00:00Z")
+    symbol_spec = TargetSymbolSpec(
+        tick_size=Decimal("0.1"), volume_min=Decimal("1"), volume_max=Decimal("100"),
+        volume_step=Decimal("1"), stops_level=Decimal("0.1"), freeze_level=Decimal("0.1"),
+    )
+    port = MutableExecutionPort(
+        target_state(
+            long="2",
+            positions=(TargetPositionState("long-ticket", "long", Decimal("2"), Decimal("3991"), Decimal("4007")),),
+            quote=quote,
+            symbol_spec=symbol_spec,
+        )
+    )
+    coordinator = SymbolCoordinator("GC", "XAUUSD", port, policy=AtasAuthoritativePolicy(execution_enabled=True))
+    coordinator.handle(
+        SourceEvent(
+            session_id="reconnected-session", event_id=1, event_type=SourceEventType.SNAPSHOT,
+            source_symbol="GC", occurred_at_utc="2026-08-08T00:00:00Z",
+            position=SourcePosition("GC", Decimal("2"), None), snapshot_orders=(),
+            snapshot_orders_complete=False, position_complete=True,
+        )
+    )
+    moved_stop = SourceOrder(**{**source_order("sl").__dict__, "comment": "SL", "trigger_price": Decimal("3992")})
+
+    result = coordinator.handle(
+        SourceEvent(
+            session_id="reconnected-session", event_id=2, event_type=SourceEventType.ORDER,
+            source_symbol="GC", occurred_at_utc="2026-08-08T00:00:01Z", order=moved_stop,
+        )
+    )
+
+    assert [command.command_type for command in result.commands] == [CommandType.MODIFY_POSITION_PROTECTION]
+    assert result.commands[0].payload["stop_loss"] == Decimal("3992")
+    assert result.commands[0].payload["take_profit"] == Decimal("4007")
 
 
 def test_same_atas_order_id_price_change_cancels_confirmed_target_leg_then_versions_replacement():
