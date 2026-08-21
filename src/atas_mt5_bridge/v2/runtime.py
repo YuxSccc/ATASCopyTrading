@@ -71,6 +71,8 @@ class BridgeRuntime:
 def _json_default(value: object) -> object:
     if isinstance(value, Decimal):
         return str(value)
+    if isinstance(value, frozenset):
+        return sorted(value)
     if hasattr(value, "value"):
         return value.value
     raise TypeError(f"not JSON serializable: {type(value)!r}")

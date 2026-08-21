@@ -76,6 +76,10 @@ class TargetLegState(str, Enum):
     CANCELLED = "cancelled"
     FILLED = "filled"
     MISSING_ON_TARGET = "missing_on_target"
+    # A complete target snapshot proves a bridge pending order disappeared,
+    # and its directional net change matches that order while ATAS is still
+    # reporting it active.  This bounded state avoids a close/re-open cycle.
+    TARGET_FILL_GRACE = "target_fill_grace"
     FAILED = "failed"
     UNKNOWN = "unknown"
 
@@ -227,6 +231,9 @@ class TargetLeg:
     target_order_ticket: str | None = None
     target_position_ticket: str | None = None
     bridge_tag: str = ""
+    # Persisted wall time: restarting the bridge must not create a fresh
+    # target-fill grace interval.
+    target_fill_grace_started_at_utc: str | None = None
 
     @property
     def requires_target_order(self) -> bool:

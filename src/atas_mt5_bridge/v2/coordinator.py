@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from time import monotonic
 from typing import Protocol
 
@@ -345,6 +345,7 @@ class SymbolCoordinator:
 
     def _apply_observed_target(self, target: TargetAccountState) -> bool:
         self.ledger.synchronize_target(target)
+        self._apply_target_fill_grace(self.source_book.snapshot(), target)
         expired = self.operation_book.expire_unconfirmed(self.operation_confirmation_timeout)
         self._withdraw_expired_commands(expired)
         resolved = self.operation_book.resolve_from_snapshot(target, self.ledger)
@@ -359,6 +360,53 @@ class SymbolCoordinator:
         except Exception:
             return False
         return True
+
+    def _apply_target_fill_grace(self, source: SourceSymbolState, target: TargetAccountState) -> None:
+        """Manage the bounded, durable MT5-first-fill exception.
+
+        Classification runs only after a complete target snapshot.  It cannot
+        accidentally hide a missing target order from a source-only callback.
+        """
+
+        eligible = getattr(self.policy, "target_fill_grace_eligible", None)
+        seconds = int(getattr(self.policy, "target_fill_grace_seconds", 0) or 0)
+        if not callable(eligible) or seconds <= 0:
+            return
+        now = datetime.now(timezone.utc)
+        multiplier = getattr(self.policy, "volume_multiplier", 1)
+        for leg in tuple(self.ledger.legs.values()):
+            intent = self.ledger.intents.get(leg.intent_id)
+            if leg.state == TargetLegState.MISSING_ON_TARGET and eligible(source, target, leg):
+                self.ledger.update_leg(
+                    replace(
+                        leg,
+                        state=TargetLegState.TARGET_FILL_GRACE,
+                        target_fill_grace_started_at_utc=now.isoformat(),
+                    )
+                )
+                continue
+            if leg.state != TargetLegState.TARGET_FILL_GRACE:
+                continue
+            if intent is None or intent.state == IntentState.RETIRED:
+                self.ledger.update_leg(
+                    replace(leg, state=TargetLegState.CANCELLED, target_fill_grace_started_at_utc=None)
+                )
+                continue
+            # ATAS has caught up at the position layer. Keep this source leg
+            # parked until its own terminal callback retires it; recreating a
+            # pending MT5 order in that callback-ordering window is unsafe.
+            if source.position is not None and source.position_complete and (
+                source.position.net_quantity * multiplier == target.net_quantity
+            ):
+                continue
+            started = _parse_utc(leg.target_fill_grace_started_at_utc)
+            if started is None or now - started >= timedelta(seconds=seconds):
+                # The target fill never reached ATAS.  Release the mapping so
+                # normal ATAS-authoritative repair closes the unmatched target
+                # quantity, then recreates a fresh pending mirror if needed.
+                self.ledger.update_leg(
+                    replace(leg, state=TargetLegState.CANCELLED, target_fill_grace_started_at_utc=None)
+                )
 
     def _persist_source(self, event: SourceEvent, state: SourceSymbolState) -> bool:
         is_quote = event.event_type == SourceEventType.AUXILIARY and event.quote is not None
@@ -536,3 +584,13 @@ def _valid_target_ticket(value: str | None) -> str | None:
     except ValueError:
         return None
     return str(ticket) if ticket > 0 else None
+
+
+def _parse_utc(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)

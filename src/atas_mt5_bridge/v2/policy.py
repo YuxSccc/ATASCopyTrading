@@ -33,6 +33,10 @@ class AtasAuthoritativePolicy:
     execution_enabled: bool = False
     price_mapper: PriceMapper | None = None
     require_price_guard: bool = False
+    # Retain a bridge-owned MT5 pending fill briefly while ATAS reports the
+    # source order as still active. This avoids an unnecessary MT5 close and
+    # re-entry solely because ATAS's fill callback arrived later.
+    target_fill_grace_seconds: int = 30
 
     def plan(
         self,
@@ -78,7 +82,11 @@ class AtasAuthoritativePolicy:
         # target pending orders. This is the fast repair path after asymmetric
         # fills, while cancel commands above remain highest priority.
         if self.position_reconciliation_enabled and source.position_complete and source.position is not None:
-            position_command = self._position_command(source, target)
+            position_command = self._position_command(
+                source,
+                target,
+                self._reserved_target_fill_quantity(source, target, ledger),
+            )
             if position_command is not None:
                 commands.append(position_command)
 
@@ -196,10 +204,17 @@ class AtasAuthoritativePolicy:
         self,
         source: SourceSymbolState,
         target: TargetAccountState,
+        reserved_target_fill_quantity: Decimal = Decimal("0"),
     ) -> BridgeCommand | None:
         assert source.position is not None
         desired_net = source.position.net_quantity * self.volume_multiplier
         delta = desired_net - target.net_quantity
+        # Reserve only the known MT5-first fill. Any excess mismatch keeps
+        # reconciling immediately, so this exception never blocks the symbol.
+        if delta < 0:
+            delta += min(-delta, reserved_target_fill_quantity)
+        elif delta > 0:
+            delta -= min(delta, reserved_target_fill_quantity)
         if delta == 0:
             return None
 
@@ -245,9 +260,58 @@ class AtasAuthoritativePolicy:
             payload={
                 "side": "buy" if delta > 0 else "sell",
                 "quantity": abs(delta),
-                "expected_target_net": desired_net,
+                "expected_target_net": target.net_quantity + delta,
                 "reason": "atas_net_reconcile",
             },
+        )
+
+    def target_fill_grace_eligible(
+        self,
+        source: SourceSymbolState,
+        target: TargetAccountState,
+        leg: TargetLeg,
+    ) -> bool:
+        """Recognize a missing pending order as a known target fill only.
+
+        An absent order by itself can be a manual MT5 cancellation. Grace is
+        allowed only when a complete snapshot also shows the exact directional
+        target excess implied by this still-active ATAS order.
+        """
+
+        if self.target_fill_grace_seconds <= 0 or leg.role != TargetLegRole.ENTRY_PENDING:
+            return False
+        if leg.state not in {TargetLegState.MISSING_ON_TARGET, TargetLegState.TARGET_FILL_GRACE}:
+            return False
+        source_order = source.active_orders.get(leg.source_key.source_order_id)
+        if source_order is None or source.position is None or not source.position_complete:
+            return False
+        if source_order.side.lower() != leg.side.lower() or source_order.unfilled <= 0:
+            return False
+        desired_net = source.position.net_quantity * self.volume_multiplier
+        directional_excess = target.net_quantity - desired_net
+        if leg.side.lower() == "sell":
+            directional_excess = -directional_excess
+        return directional_excess >= leg.quantity
+
+    def _reserved_target_fill_quantity(
+        self,
+        source: SourceSymbolState,
+        target: TargetAccountState,
+        ledger: IntentLedger,
+    ) -> Decimal:
+        if source.position is None:
+            return Decimal("0")
+        delta = source.position.net_quantity * self.volume_multiplier - target.net_quantity
+        if delta == 0:
+            return Decimal("0")
+        protected_side = "buy" if delta < 0 else "sell"
+        return sum(
+            (
+                leg.quantity
+                for leg in ledger.legs.values()
+                if leg.state == TargetLegState.TARGET_FILL_GRACE and leg.side.lower() == protected_side
+            ),
+            Decimal("0"),
         )
 
     def _protection_commands(

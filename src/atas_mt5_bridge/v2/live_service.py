@@ -38,6 +38,7 @@ class LiveBridgeController:
     basis_recording_directory: Path | None = None
     execution_enabled: bool = False
     volume_multiplier: Decimal = Decimal("1")
+    target_fill_grace_seconds: int = 30
     price_guard_config: PriceGuardConfig = field(default_factory=PriceGuardConfig)
     test_controller: DemoTestController | None = None
     gateway: Mt5HttpGateway = field(init=False)
@@ -63,6 +64,7 @@ class LiveBridgeController:
             policy=AtasAuthoritativePolicy(
                 volume_multiplier=self.volume_multiplier,
                 execution_enabled=self.execution_enabled,
+                target_fill_grace_seconds=self.target_fill_grace_seconds,
                 price_mapper=mapper,
                 require_price_guard=self.execution_enabled,
             ),
@@ -279,6 +281,7 @@ class LiveBridgeController:
                 "target_symbol": self.target_symbol,
                 "bridge_magic": self.bridge_magic,
                 "volume_multiplier": str(self.volume_multiplier),
+                "target_fill_grace_seconds": self.target_fill_grace_seconds,
                 "execution_enabled": self.execution_enabled,
                 "source_synchronized": self.coordinator.source_book.has_synchronized_snapshot,
                 "source_position_complete": self.coordinator.source_book.snapshot().position_complete
@@ -754,6 +757,12 @@ def main() -> int:
     parser.add_argument("--websocket-port", type=int, default=8767)
     parser.add_argument("--mt5-http-port", type=int, default=8768)
     parser.add_argument("--volume-multiplier", type=Decimal, default=Decimal("1"))
+    parser.add_argument(
+        "--target-fill-grace-seconds",
+        type=int,
+        default=30,
+        help="retain a known MT5-first pending fill before ATAS-authoritative net repair (0 disables)",
+    )
     parser.add_argument("--basis-window-seconds", type=int, default=4 * 60 * 60)
     parser.add_argument("--basis-half-life-seconds", type=int, default=15 * 60)
     parser.add_argument("--basis-sample-interval-seconds", type=int, default=60)
@@ -769,6 +778,8 @@ def main() -> int:
         parser.error("basis window and half-life must be positive")
     if args.basis_minimum_samples <= 0 or args.quote_max_age_ms <= 0 or args.basis_sample_interval_seconds <= 0:
         parser.error("basis sample count, sample interval, and quote maximum age must be positive")
+    if args.target_fill_grace_seconds < 0:
+        parser.error("--target-fill-grace-seconds must be zero or positive")
     if not _valid_multiplier(args.volume_multiplier):
         parser.error("--volume-multiplier must be a finite positive decimal")
     try:
@@ -799,6 +810,7 @@ def main() -> int:
             basis_recording_directory=Path(args.output_dir),
             execution_enabled=args.enable_execution,
             volume_multiplier=volume_multiplier,
+            target_fill_grace_seconds=args.target_fill_grace_seconds,
             price_guard_config=price_guard_config,
             test_controller=test_controller,
         )

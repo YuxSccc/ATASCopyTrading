@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 
 from atas_mt5_bridge.v2.coordinator import SymbolCoordinator
 from atas_mt5_bridge.v2.intent_ledger import IntentLedger, TargetLegSpec
@@ -446,6 +448,90 @@ def test_active_target_pending_order_missing_from_complete_snapshot_quarantines_
 
     assert observed.reconciliation_required is True
     assert coordinator.ledger.get_leg(leg.leg_id).state == TargetLegState.MISSING_ON_TARGET
+
+
+def _activate_target_pending_leg(coordinator: SymbolCoordinator, port: MutableExecutionPort):
+    coordinator.handle(snapshot())
+    coordinator.handle(event(2, SourceEventType.ORDER, order=source_order()))
+    leg = next(iter(coordinator.ledger.legs.values()))
+    port.state = target_state(
+        pending_orders=(
+            TargetOrderState(
+                ticket="pending-fill-race",
+                side="sell",
+                order_type="stop",
+                quantity=Decimal("2"),
+                price=Decimal("4000"),
+                trigger_price=Decimal("4000"),
+                leg_id=leg.leg_id,
+            ),
+        )
+    )
+    coordinator.handle_target_observation()
+    assert coordinator.ledger.get_leg(leg.leg_id).state == TargetLegState.ACTIVE
+    return leg
+
+
+def _target_first_fill_state():
+    return target_state(
+        short="2",
+        positions=(TargetPositionState("target-short", "short", Decimal("2")),),
+    )
+
+
+def test_target_first_pending_fill_gets_bounded_grace_without_delaying_other_repairs():
+    port = MutableExecutionPort(target_state())
+    coordinator = SymbolCoordinator("GC", "XAUUSD", port, policy=AtasAuthoritativePolicy(execution_enabled=True))
+    leg = _activate_target_pending_leg(coordinator, port)
+    port.state = _target_first_fill_state()
+
+    observed = coordinator.handle_target_observation()
+
+    assert observed is not None
+    assert observed.commands == ()
+    saved = coordinator.ledger.get_leg(leg.leg_id)
+    assert saved is not None
+    assert saved.state == TargetLegState.TARGET_FILL_GRACE
+    assert saved.target_fill_grace_started_at_utc is not None
+
+
+def test_target_first_fill_grace_expires_to_an_ordinary_atas_net_repair():
+    port = MutableExecutionPort(target_state())
+    coordinator = SymbolCoordinator("GC", "XAUUSD", port, policy=AtasAuthoritativePolicy(execution_enabled=True))
+    leg = _activate_target_pending_leg(coordinator, port)
+    port.state = _target_first_fill_state()
+    coordinator.handle_target_observation()
+    grace_leg = coordinator.ledger.get_leg(leg.leg_id)
+    assert grace_leg is not None
+    coordinator.ledger.update_leg(
+        replace(
+            grace_leg,
+            target_fill_grace_started_at_utc=(datetime.now(timezone.utc) - timedelta(seconds=31)).isoformat(),
+        )
+    )
+
+    expired = coordinator.handle_target_observation()
+
+    assert expired is not None
+    assert [command.command_type for command in expired.commands] == [CommandType.CLOSE_POSITION]
+    assert expired.commands[0].payload["position_ticket"] == "target-short"
+    assert expired.commands[0].payload["quantity"] == Decimal("2")
+
+
+def test_explicit_atas_cancellation_ends_target_first_fill_grace_immediately():
+    port = MutableExecutionPort(target_state())
+    coordinator = SymbolCoordinator("GC", "XAUUSD", port, policy=AtasAuthoritativePolicy(execution_enabled=True))
+    leg = _activate_target_pending_leg(coordinator, port)
+    port.state = _target_first_fill_state()
+    coordinator.handle_target_observation()
+    cancelled = SourceOrder(**{**source_order().__dict__, "state": SourceOrderState.DONE, "cancelled": True})
+
+    result = coordinator.handle(event(3, SourceEventType.ORDER, order=cancelled))
+
+    assert [command.command_type for command in result.commands] == [CommandType.CLOSE_POSITION]
+    saved = coordinator.ledger.get_leg(leg.leg_id)
+    assert saved is not None
+    assert saved.state == TargetLegState.CANCELLED
 
 
 def test_atas_tp_sl_comments_map_to_native_mt5_position_protection_not_opposite_pending_orders():
