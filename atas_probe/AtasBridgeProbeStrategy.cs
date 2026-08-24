@@ -20,10 +20,10 @@ namespace AtasMt5ProbeStrategy
     /// available from the installed ATAS version before copy logic is introduced.
     /// </summary>
     [Category("Custom")]
-    [DisplayName("AtasMt5BridgeProbeV7")]
+    [DisplayName("AtasMt5BridgeProbeV8")]
     public sealed class AtasBridgeProbeStrategy : ChartStrategy
     {
-        private const string BuildTag = "2026-08-24-probe-v7-chart-status";
+        private const string BuildTag = "2026-08-24-probe-v8-compact-right-status";
         private ProbeWebSocketClient? _client;
         private string _sessionId = "";
         private long _eventSequence;
@@ -50,8 +50,7 @@ namespace AtasMt5ProbeStrategy
         private bool _basisRequestCompleted;
         private long _basisHistoricalTickCount;
         private string _bridgeStatus = "CONNECTING: waiting for local bridge acknowledgement";
-        private readonly RenderFont _bridgeStatusTitleFont = new RenderFont("Arial", 13);
-        private readonly RenderFont _bridgeStatusMessageFont = new RenderFont("Arial", 10);
+        private readonly RenderFont _bridgeStatusMessageFont = new RenderFont("Arial", 9);
         private bool _disposed;
 
         private sealed class ObservedOrder
@@ -263,14 +262,16 @@ namespace AtasMt5ProbeStrategy
 
             var status = _bridgeStatus;
             var statusColor = BridgeStatusColor(status);
-            const int left = 12;
-            const int top = 12;
-            const int width = 460;
-            const int height = 55;
+            if (Container == null)
+                return;
+            var region = Container.Region;
+            const int width = 340;
+            const int height = 24;
+            var left = Math.Max(region.X + 4, region.Right - width - 8);
+            var top = region.Y + 8;
             context.FillRectangle(Color.FromArgb(220, 24, 27, 32), new Rectangle(left, top, width, height));
-            context.FillRectangle(statusColor, new Rectangle(left, top, 5, height));
-            context.DrawString("ATAS → MT5 bridge", _bridgeStatusTitleFont, Color.White, left + 14, top + 7);
-            context.DrawString(FormatChartStatus(status), _bridgeStatusMessageFont, statusColor, left + 14, top + 31);
+            context.FillRectangle(statusColor, new Rectangle(left, top, 3, height));
+            context.DrawString(FormatChartStatus(status), _bridgeStatusMessageFont, statusColor, left + 10, top + 5);
         }
 
         protected override void OnSuspended() => StopProbe();
@@ -580,7 +581,7 @@ namespace AtasMt5ProbeStrategy
 
         private static string FormatChartStatus(string status)
         {
-            const int maximumLength = 82;
+            const int maximumLength = 58;
             return status.Length <= maximumLength
                 ? status
                 : status.Substring(0, maximumLength - 1) + "…";
