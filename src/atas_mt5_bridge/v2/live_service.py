@@ -166,6 +166,13 @@ class LiveBridgeController:
                     "message": f"{self.source_symbol}->{self.target_symbol}: waiting for MT5 snapshot confirmation",
                     "reconciliation_required": False,
                 }
+            warning = getattr(self.coordinator.policy, "last_mapping_warning", None)
+            if warning:
+                return {
+                    "state": "warning",
+                    "message": f"{self.source_symbol}->{self.target_symbol}: current order was not mapped: {warning}",
+                    "reconciliation_required": False,
+                }
             return {
                 "state": "ready",
                 "message": f"{self.source_symbol}->{self.target_symbol}: bridge is ready",

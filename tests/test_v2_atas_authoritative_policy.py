@@ -188,6 +188,27 @@ def test_basis_refresh_does_not_cancel_or_reprice_an_existing_source_order_insta
     assert coordinator.ledger.get_leg(leg.leg_id).state == TargetLegState.ACTIVE
 
 
+def test_rejected_pending_price_is_exposed_as_a_non_fatal_mapping_warning():
+    class RejectingMapper:
+        def record_pair(self, source_quote, target_quote) -> None:
+            return None
+
+        def to_data(self) -> dict:
+            return {}
+
+        def map_pending(self, order, source_quote, target, target_quantity=None) -> PriceDecision:
+            return PriceDecision(False, "price_guard_basis_shock")
+
+    policy = AtasAuthoritativePolicy(execution_enabled=True, price_mapper=RejectingMapper())
+    port = MutableExecutionPort(target_state())
+    coordinator = SymbolCoordinator("GC", "XAUUSD", port, policy=policy)
+
+    result = coordinator.handle(snapshot(orders=(source_order(),)))
+
+    assert result.commands == ()
+    assert policy.last_mapping_warning == "price_guard_basis_shock"
+
+
 def test_atas_authoritative_policy_is_inert_until_execution_is_explicitly_enabled():
     port = MutableExecutionPort(target_state())
     coordinator = SymbolCoordinator("GC", "XAUUSD", port, policy=AtasAuthoritativePolicy())

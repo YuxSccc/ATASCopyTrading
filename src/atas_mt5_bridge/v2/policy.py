@@ -37,6 +37,10 @@ class AtasAuthoritativePolicy:
     # source order as still active. This avoids an unnecessary MT5 close and
     # re-entry solely because ATAS's fill callback arrived later.
     target_fill_grace_seconds: int = 30
+    # Non-fatal explanation for the most recent source order deliberately not
+    # mapped. The live service returns it to ATAS as WARNING rather than
+    # silently looking healthy while a price/volume guard skipped an order.
+    last_mapping_warning: str | None = None
 
     def plan(
         self,
@@ -151,6 +155,7 @@ class AtasAuthoritativePolicy:
             # Do not compress ATAS StopLimit or a future order type into a
             # different MT5 order class. Unsupported semantics must remain
             # observable but non-executable until explicitly modelled.
+            self.last_mapping_warning = f"unsupported ATAS order type: {order.order_type}"
             return None
         price = order.trigger_price if "stop" in order.order_type.lower() else order.price
         trigger_price = None
@@ -158,11 +163,14 @@ class AtasAuthoritativePolicy:
         if self.price_mapper is not None:
             decision = self.price_mapper.map_pending(order, source.quote, target, target_quantity=target_quantity)
             if not decision.allowed:
+                self.last_mapping_warning = decision.reason or "pending price guard rejected the order"
                 return None
             price = decision.price
             trigger_price = decision.trigger_price
         elif self.require_price_guard:
+            self.last_mapping_warning = "pending price guard is unavailable"
             return None
+        self.last_mapping_warning = None
         return TargetLegSpec(
             role=_role_for_source_order(order.comment),
             side=order.side,
