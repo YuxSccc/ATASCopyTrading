@@ -2,12 +2,15 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Drawing;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using ATAS.DataFeedsCore;
 using ATAS.Indicators;
 using ATAS.Strategies.Chart;
+using OFT.Rendering.Context;
+using OFT.Rendering.Tools;
 
 namespace AtasMt5ProbeStrategy
 {
@@ -17,10 +20,10 @@ namespace AtasMt5ProbeStrategy
     /// available from the installed ATAS version before copy logic is introduced.
     /// </summary>
     [Category("Custom")]
-    [DisplayName("AtasMt5BridgeProbeV6")]
+    [DisplayName("AtasMt5BridgeProbeV7")]
     public sealed class AtasBridgeProbeStrategy : ChartStrategy
     {
-        private const string BuildTag = "2026-08-22-probe-v6-safe-basis";
+        private const string BuildTag = "2026-08-24-probe-v7-chart-status";
         private ProbeWebSocketClient? _client;
         private string _sessionId = "";
         private long _eventSequence;
@@ -47,6 +50,8 @@ namespace AtasMt5ProbeStrategy
         private bool _basisRequestCompleted;
         private long _basisHistoricalTickCount;
         private string _bridgeStatus = "CONNECTING: waiting for local bridge acknowledgement";
+        private readonly RenderFont _bridgeStatusTitleFont = new RenderFont("Arial", 13);
+        private readonly RenderFont _bridgeStatusMessageFont = new RenderFont("Arial", 10);
         private bool _disposed;
 
         private sealed class ObservedOrder
@@ -119,6 +124,19 @@ namespace AtasMt5ProbeStrategy
         [ReadOnly(true)]
         [DisplayName("Bridge status (read-only)")]
         public string BridgeStatus => _bridgeStatus;
+
+        public AtasBridgeProbeStrategy()
+        {
+            // The strategy owns the status overlay. It is deliberately drawn
+            // through ATAS' rendering API rather than a WPF control so it is
+            // lightweight, chart-local, and safe for ATAS' custom strategy
+            // loader. Final is needed for RedrawChart() calls originating from
+            // the asynchronous bridge acknowledgement path.
+            EnableCustomDrawing = true;
+            DrawAbovePrice = true;
+            SubscribeToDrawingEvents(DrawingLayouts.Final);
+            DataSeries[0].IsHidden = true;
+        }
 
         protected override void OnStarted()
         {
@@ -236,6 +254,23 @@ namespace AtasMt5ProbeStrategy
             // the prior request completes instead of waiting for a passive
             // trade callback or a second strategy.
             TryRequestBasisHistoryWindow();
+        }
+
+        protected override void OnRender(RenderContext context, DrawingLayouts layout)
+        {
+            if (layout != DrawingLayouts.Final)
+                return;
+
+            var status = _bridgeStatus;
+            var statusColor = BridgeStatusColor(status);
+            const int left = 12;
+            const int top = 12;
+            const int width = 460;
+            const int height = 55;
+            context.FillRectangle(Color.FromArgb(220, 24, 27, 32), new Rectangle(left, top, width, height));
+            context.FillRectangle(statusColor, new Rectangle(left, top, 5, height));
+            context.DrawString("ATAS → MT5 bridge", _bridgeStatusTitleFont, Color.White, left + 14, top + 7);
+            context.DrawString(FormatChartStatus(status), _bridgeStatusMessageFont, statusColor, left + 14, top + 31);
         }
 
         protected override void OnSuspended() => StopProbe();
@@ -529,6 +564,26 @@ namespace AtasMt5ProbeStrategy
                 return;
             _bridgeStatus = next;
             StrategyLog.Append($"Bridge status source={GetSourceSymbol()}: {_bridgeStatus}\n");
+            RedrawChart();
+        }
+
+        private static Color BridgeStatusColor(string status)
+        {
+            if (status.StartsWith("READY:", StringComparison.OrdinalIgnoreCase))
+                return Color.FromArgb(82, 210, 128);
+            if (status.StartsWith("WARNING:", StringComparison.OrdinalIgnoreCase))
+                return Color.Gold;
+            if (status.StartsWith("BLOCKED:", StringComparison.OrdinalIgnoreCase))
+                return Color.FromArgb(248, 94, 94);
+            return Color.FromArgb(126, 184, 255);
+        }
+
+        private static string FormatChartStatus(string status)
+        {
+            const int maximumLength = 82;
+            return status.Length <= maximumLength
+                ? status
+                : status.Substring(0, maximumLength - 1) + "…";
         }
 
         private void MaybeEmitRecoverySnapshot(bool force = false)

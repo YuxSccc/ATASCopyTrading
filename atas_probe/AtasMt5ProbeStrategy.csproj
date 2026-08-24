@@ -38,6 +38,9 @@
     <Reference Include="OFT.Attributes">
       <HintPath>$(ATAS_HOME)\OFT.Attributes.dll</HintPath>
     </Reference>
+    <Reference Include="OFT.Rendering">
+      <HintPath>$(ATAS_HOME)\OFT.Rendering.dll</HintPath>
+    </Reference>
     <Reference Include="Utils.Common">
       <HintPath>$(ATAS_HOME)\Utils.Common.dll</HintPath>
     </Reference>
