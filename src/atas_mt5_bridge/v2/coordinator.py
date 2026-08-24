@@ -349,6 +349,12 @@ class SymbolCoordinator:
         expired = self.operation_book.expire_unconfirmed(self.operation_confirmation_timeout)
         self._withdraw_expired_commands(expired)
         resolved = self.operation_book.resolve_from_snapshot(target, self.ledger)
+        superseded_creates = self.operation_book.resolve_creates_superseded_by_cancellation(
+            target,
+            self.ledger,
+            resolved,
+        )
+        resolved = (*resolved, *superseded_creates)
         for record in resolved:
             command = record.command
             if command.command_type == CommandType.CANCEL_PENDING and command.leg_id is not None:

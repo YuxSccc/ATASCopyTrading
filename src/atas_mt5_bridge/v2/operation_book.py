@@ -100,6 +100,59 @@ class OperationBook:
             resolved.append(updated)
         return tuple(resolved)
 
+    def resolve_creates_superseded_by_cancellation(
+        self,
+        target: TargetAccountState,
+        ledger: IntentLedger,
+        resolved_operations: Iterable[OperationRecord],
+    ) -> tuple[OperationRecord, ...]:
+        """Close an unobserved create once its exact later cancel is proved.
+
+        An EA can accept a create, then receive an ATAS-driven cancellation
+        before the next complete account snapshot.  The order may therefore
+        never appear in a snapshot at all.  A *confirmed ticket-specific*
+        cancellation plus a complete snapshot without the leg proves there is
+        no remaining target pending-order risk, so retaining the create as
+        ``UNKNOWN`` would be a false quarantine.
+        """
+
+        if not target.snapshot_complete:
+            return ()
+        cancelled_leg_ids = {
+            record.command.leg_id
+            for record in resolved_operations
+            if record.command.command_type == CommandType.CANCEL_PENDING and record.command.leg_id
+        }
+        cancelled_leg_ids.update(
+            record.command.leg_id
+            for record in self.records.values()
+            if record.command.command_type == CommandType.CANCEL_PENDING
+            and record.status == OperationStatus.CONFIRMED
+            and record.resolved_at_utc is not None
+            and record.command.leg_id
+        )
+        if not cancelled_leg_ids:
+            return ()
+        resolved: list[OperationRecord] = []
+        for command_id, record in tuple(self.records.items()):
+            command = record.command
+            if (
+                command.command_type != CommandType.CREATE_PENDING
+                or command.leg_id not in cancelled_leg_ids
+                or record.resolved_at_utc is not None
+                or _has_target_order_for_leg(command.leg_id, ledger, target)
+            ):
+                continue
+            updated = replace(
+                record,
+                status=OperationStatus.CONFIRMED,
+                message="create was safely superseded by a confirmed ticket-specific cancellation",
+                resolved_at_utc=_now(),
+            )
+            self.records[command_id] = updated
+            resolved.append(updated)
+        return tuple(resolved)
+
     def expire_unconfirmed(self, timeout: timedelta, now: datetime | None = None) -> tuple[OperationRecord, ...]:
         """Quarantine requests that were accepted but never become observable.
 

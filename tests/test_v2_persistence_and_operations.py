@@ -120,6 +120,50 @@ def test_failed_cancel_is_released_only_when_a_complete_snapshot_proves_order_ab
     assert resolved[0].status == OperationStatus.CONFIRMED
 
 
+def test_confirmed_cancel_resolves_an_unobserved_create_for_the_same_leg():
+    """A fast ATAS cancel can remove an EA-accepted create before a snapshot."""
+
+    book = OperationBook()
+    create = BridgeCommand(
+        command_id="create-before-snapshot",
+        command_type=CommandType.CREATE_PENDING,
+        target_symbol="XAUUSD",
+        source_event_id=1,
+        intent_id="intent",
+        leg_id="leg",
+    )
+    cancel = BridgeCommand(
+        command_id="cancel-before-snapshot",
+        command_type=CommandType.CANCEL_PENDING,
+        target_symbol="XAUUSD",
+        source_event_id=2,
+        intent_id="intent",
+        leg_id="leg",
+        payload={"target_order_ticket": "123"},
+    )
+    book.dispatch(create)
+    book.apply_receipt(ExecutionReceipt(create.command_id, OperationStatus.ACCEPTED, target_reference="123"))
+    book.dispatch(cancel)
+    book.apply_receipt(ExecutionReceipt(cancel.command_id, OperationStatus.ACCEPTED, target_reference="123"))
+
+    cancel_resolution = book.resolve_from_snapshot(target_state(), IntentLedger())
+    superseded = book.resolve_creates_superseded_by_cancellation(target_state(), IntentLedger(), cancel_resolution)
+
+    assert [record.command.command_id for record in cancel_resolution] == [cancel.command_id]
+    assert [record.command.command_id for record in superseded] == [create.command_id]
+    assert book.has_in_flight() is False
+
+    # On a bridge restart the cancellation is already persisted as resolved;
+    # the same complete snapshot must still clear the formerly unknown create.
+    restarted = OperationBook()
+    restarted.restore(book.records.values())
+    restarted.records[create.command_id] = replace(
+        restarted.records[create.command_id], status=OperationStatus.UNKNOWN, resolved_at_utc=None
+    )
+    recovered = restarted.resolve_creates_superseded_by_cancellation(target_state(), IntentLedger(), ())
+    assert [record.command.command_id for record in recovered] == [create.command_id]
+
+
 def test_market_reconciliation_is_not_repeated_before_observed_target_confirmation():
     port = StaticTargetPort(target_state())
     coordinator = SymbolCoordinator(
