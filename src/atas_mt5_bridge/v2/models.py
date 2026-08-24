@@ -231,6 +231,10 @@ class TargetLeg:
     target_order_ticket: str | None = None
     target_position_ticket: str | None = None
     bridge_tag: str = ""
+    # Stable projection of the ATAS order fields that define an amendment.
+    # It separates a genuine source-side price move from an unrelated basis
+    # recalculation of the target price.
+    source_order_fingerprint: str = ""
     # Persisted wall time: restarting the bridge must not create a fresh
     # target-fill grace interval.
     target_fill_grace_started_at_utc: str | None = None

@@ -119,6 +119,59 @@ class LiveBridgeController:
             if self.test_controller is not None:
                 self.test_controller.observe_probe_event(payload)
 
+    def probe_bridge_status(self) -> dict[str, object]:
+        """Return the compact per-pair status displayed by the ATAS probe."""
+
+        with self._lock:
+            operations = tuple(self.coordinator.operation_book.records.values())
+            if not self.coordinator.source_book.has_synchronized_snapshot:
+                return {
+                    "state": "waiting",
+                    "message": f"{self.source_symbol}->{self.target_symbol}: waiting for synchronized ATAS state",
+                    "reconciliation_required": False,
+                }
+            target_snapshot = self.gateway.snapshot_status()
+            if not target_snapshot["received"] or not target_snapshot["fresh"]:
+                return {
+                    "state": "waiting",
+                    "message": f"{self.source_symbol}->{self.target_symbol}: waiting for a fresh MT5 snapshot",
+                    "reconciliation_required": False,
+                }
+            if self.coordinator.reconciliation_required:
+                unknown = next(
+                    (
+                        record
+                        for record in operations
+                        if record.resolved_at_utc is None and record.status in {OperationStatus.UNKNOWN, OperationStatus.FAILED}
+                    ),
+                    None,
+                )
+                if unknown is not None:
+                    return {
+                        "state": "blocked",
+                        "message": (
+                            f"{self.source_symbol}->{self.target_symbol}: MT5 {unknown.command.command_type.value} "
+                            f"outcome is unconfirmed; automatic mapping for this pair is stopped"
+                        ),
+                        "reconciliation_required": True,
+                    }
+                return {
+                    "state": "blocked",
+                    "message": f"{self.source_symbol}->{self.target_symbol}: reconciliation is required; automatic mapping for this pair is stopped",
+                    "reconciliation_required": True,
+                }
+            if any(record.resolved_at_utc is None for record in operations):
+                return {
+                    "state": "waiting",
+                    "message": f"{self.source_symbol}->{self.target_symbol}: waiting for MT5 snapshot confirmation",
+                    "reconciliation_required": False,
+                }
+            return {
+                "state": "ready",
+                "message": f"{self.source_symbol}->{self.target_symbol}: bridge is ready",
+                "reconciliation_required": False,
+            }
+
     def _normalize_atas_payload(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         """Replace a connector display name with this runtime's source key.
 
@@ -449,6 +502,9 @@ class PairRoutedBridgeController:
     def handle_atas_message(self, payload: Mapping[str, Any]) -> None:
         self._resolve(payload, "atas").handle_atas_message(payload)
 
+    def probe_bridge_status(self, payload: Mapping[str, Any]) -> dict[str, object]:
+        return self._resolve(payload, "atas").probe_bridge_status()
+
     def handle_mt5_snapshot(self, payload: Mapping[str, Any]) -> None:
         self._resolve(payload, "mt5").handle_mt5_snapshot(payload)
 
@@ -713,6 +769,9 @@ async def serve(
                     event = parse_probe_event(payload)
                     acknowledgement = recorder.record(event)
                     controller.handle_atas_message(payload)
+                    probe_status = getattr(controller, "probe_bridge_status", None)
+                    if callable(probe_status):
+                        acknowledgement["bridge_status"] = probe_status(payload)
                     if controller.test_controller is not None:
                         test_command = controller.test_controller.command_for_ack(event.session_id)
                         if test_command is not None:

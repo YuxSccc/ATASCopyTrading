@@ -71,6 +71,21 @@ namespace AtasMt5ProbeStrategy
 
         [JsonProperty("test_command")]
         public ProbeTestCommand? TestCommand { get; set; }
+
+        [JsonProperty("bridge_status")]
+        public ProbeBridgeStatus? BridgeStatus { get; set; }
+    }
+
+    internal sealed class ProbeBridgeStatus
+    {
+        [JsonProperty("state")]
+        public string State { get; set; } = "";
+
+        [JsonProperty("message")]
+        public string Message { get; set; } = "";
+
+        [JsonProperty("reconciliation_required")]
+        public bool ReconciliationRequired { get; set; }
     }
 
     internal sealed class ProbeTestCommand

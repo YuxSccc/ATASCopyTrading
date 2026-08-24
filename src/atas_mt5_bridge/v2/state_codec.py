@@ -84,6 +84,7 @@ def ledger_to_data(ledger: IntentLedger) -> dict[str, Any]:
                 "target_order_ticket": leg.target_order_ticket,
                 "target_position_ticket": leg.target_position_ticket,
                 "bridge_tag": leg.bridge_tag,
+                "source_order_fingerprint": leg.source_order_fingerprint,
                 "target_fill_grace_started_at_utc": leg.target_fill_grace_started_at_utc,
             }
             for leg in ledger.legs.values()
@@ -117,6 +118,7 @@ def ledger_from_data(data: Mapping[str, Any]) -> IntentLedger:
             target_order_ticket=_optional_text(item.get("target_order_ticket")),
             target_position_ticket=_optional_text(item.get("target_position_ticket")),
             bridge_tag=str(item.get("bridge_tag", "")),
+            source_order_fingerprint=str(item.get("source_order_fingerprint", "")),
             target_fill_grace_started_at_utc=_optional_text(item.get("target_fill_grace_started_at_utc")),
         )
         ledger.legs[leg.leg_id] = leg

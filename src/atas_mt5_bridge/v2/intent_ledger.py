@@ -27,6 +27,7 @@ class TargetLegSpec:
     quantity: Decimal
     price: Decimal | None
     trigger_price: Decimal | None
+    source_order_fingerprint: str = ""
 
 
 @dataclass
@@ -135,6 +136,7 @@ class IntentLedger:
                 quantity=spec.quantity,
                 price=spec.price,
                 trigger_price=spec.trigger_price,
+                source_order_fingerprint=spec.source_order_fingerprint,
                 bridge_tag=_bridge_tag(f"{intent_id}:leg:{index}"),
             )
             self.legs[leg.leg_id] = leg
@@ -294,6 +296,7 @@ def _matches_spec(leg: TargetLeg, spec: TargetLegSpec) -> bool:
         and leg.quantity == spec.quantity
         and leg.price == spec.price
         and leg.trigger_price == spec.trigger_price
+        and leg.source_order_fingerprint == spec.source_order_fingerprint
     )
 
 
@@ -306,4 +309,5 @@ def _replace_spec(leg: TargetLeg, spec: TargetLegSpec) -> TargetLeg:
         quantity=spec.quantity,
         price=spec.price,
         trigger_price=spec.trigger_price,
+        source_order_fingerprint=spec.source_order_fingerprint,
     )

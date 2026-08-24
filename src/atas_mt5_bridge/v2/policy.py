@@ -106,6 +106,20 @@ class AtasAuthoritativePolicy:
                     TargetLegRole.PROTECTIVE_SL,
                 }:
                     continue
+                source_fingerprint = _source_order_fingerprint(intent.order)
+                # A basis estimate is market data, not a source-order
+                # amendment.  Once an ATAS order instance has a target leg,
+                # preserve the mapped price for its lifetime. Repricing it on
+                # every quote/basis refresh causes a cancel/create storm even
+                # though the trader never moved the ATAS order. ATAS order
+                # moves normally produce a new source order instance, which
+                # naturally reaches the initial-mapping branch below.
+                if any(
+                    leg.state not in {TargetLegState.CANCELLED, TargetLegState.FILLED}
+                    and leg.source_order_fingerprint in {"", source_fingerprint}
+                    for leg in ledger.legs_for_intent(intent.intent_id)
+                ):
+                    continue
                 spec = self._direct_spec(intent.order, source, target)
                 if spec is None:
                     continue
@@ -156,6 +170,7 @@ class AtasAuthoritativePolicy:
             quantity=target_quantity,
             price=price,
             trigger_price=trigger_price,
+            source_order_fingerprint=_source_order_fingerprint(order),
         )
 
     def _cancel_command(
@@ -411,6 +426,21 @@ def _role_for_source_order(comment: str) -> TargetLegRole:
     if normalized == "SL":
         return TargetLegRole.PROTECTIVE_SL
     return TargetLegRole.ENTRY_PENDING
+
+
+def _source_order_fingerprint(order) -> str:
+    """Fields whose change means ATAS actually amended this order instance."""
+
+    return ":".join(
+        (
+            order.side.lower(),
+            order.order_type.lower(),
+            str(order.quantity),
+            str(order.unfilled),
+            "" if order.price is None else str(order.price),
+            "" if order.trigger_price is None else str(order.trigger_price),
+        )
+    )
 
 
 def _with_state(leg: TargetLeg, state: TargetLegState) -> TargetLeg:

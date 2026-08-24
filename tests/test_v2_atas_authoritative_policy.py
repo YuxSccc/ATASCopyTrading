@@ -25,6 +25,7 @@ from atas_mt5_bridge.v2.models import (
     TargetSymbolSpec,
 )
 from atas_mt5_bridge.v2.policy import AtasAuthoritativePolicy
+from atas_mt5_bridge.v2.pricing import PriceDecision
 
 
 class MutableExecutionPort:
@@ -45,6 +46,23 @@ class MutableExecutionPort:
         if self.raise_on_execute:
             raise TimeoutError("request outcome unavailable")
         return ExecutionReceipt(command.command_id, self.receipt_status, target_reference="target-ref")
+
+
+class MovingBasisMapper:
+    """Returns a different mapped price per call, like a changing basis."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def record_pair(self, source_quote, target_quote) -> None:
+        return None
+
+    def to_data(self) -> dict:
+        return {}
+
+    def map_pending(self, order, source_quote, target, target_quantity=None) -> PriceDecision:
+        self.calls += 1
+        return PriceDecision(True, price=Decimal("4000") + Decimal(self.calls), trigger_price=None)
 
 
 def target_state(
@@ -134,6 +152,40 @@ def test_active_source_order_creates_one_tracked_target_leg_without_duplicate_su
         event(3, SourceEventType.POSITION, position=SourcePosition("GC", Decimal("0"), None))
     )
     assert again.commands == ()
+
+
+def test_basis_refresh_does_not_cancel_or_reprice_an_existing_source_order_instance():
+    mapper = MovingBasisMapper()
+    port = MutableExecutionPort(target_state())
+    coordinator = SymbolCoordinator(
+        "GC",
+        "XAUUSD",
+        port,
+        policy=AtasAuthoritativePolicy(execution_enabled=True, price_mapper=mapper),
+    )
+    coordinator.handle(snapshot())
+    coordinator.handle(event(2, SourceEventType.ORDER, order=source_order()))
+    leg = next(iter(coordinator.ledger.legs.values()))
+    port.state = target_state(
+        pending_orders=(
+            TargetOrderState(
+                ticket="unchanged-source-order",
+                side="sell",
+                order_type="stop",
+                quantity=Decimal("2"),
+                price=Decimal("4001"),
+                trigger_price=None,
+                leg_id=leg.leg_id,
+            ),
+        )
+    )
+    coordinator.handle_target_observation()
+
+    observed = coordinator.handle(event(3, SourceEventType.POSITION, position=SourcePosition("GC", Decimal("0"), None)))
+
+    assert observed.commands == ()
+    assert mapper.calls == 1
+    assert coordinator.ledger.get_leg(leg.leg_id).state == TargetLegState.ACTIVE
 
 
 def test_atas_authoritative_policy_is_inert_until_execution_is_explicitly_enabled():

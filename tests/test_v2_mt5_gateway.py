@@ -372,6 +372,42 @@ def test_live_controller_caches_mt5_state_before_atas_snapshot_without_planning(
         controller.close()
 
 
+def test_probe_status_reports_waiting_and_pair_specific_blocking_state(tmp_path: Path):
+    controller = LiveBridgeController(
+        source_symbol="GC",
+        target_symbol="XAUUSD",
+        bridge_magic=26081001,
+        database_path=tmp_path / "bridge.db",
+        journal_path=tmp_path / "operations.jsonl",
+    )
+    try:
+        waiting = controller.probe_bridge_status()
+        assert waiting["state"] == "waiting"
+        assert "ATAS" in waiting["message"]
+
+        controller.handle_mt5_snapshot(snapshot())
+        controller.handle_atas_message(
+            {
+                "session_id": "status-session",
+                "event_id": 1,
+                "event_type": "state_snapshot",
+                "source_symbol": "GC",
+                "atas_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "data": {
+                    "position_known": True,
+                    "last_observed_position": {"security": "GC", "volume": "0", "average_price": "0"},
+                    "orders": [],
+                },
+            }
+        )
+        controller.coordinator.reconciliation_required = True
+        blocked = controller.probe_bridge_status()
+        assert blocked["state"] == "blocked"
+        assert blocked["reconciliation_required"] is True
+    finally:
+        controller.close()
+
+
 def test_observation_mode_collects_and_exposes_basis_samples(tmp_path: Path):
     controller = LiveBridgeController(
         source_symbol="GC",

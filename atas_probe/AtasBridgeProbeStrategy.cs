@@ -46,6 +46,7 @@ namespace AtasMt5ProbeStrategy
         private bool _basisRequestInFlight;
         private bool _basisRequestCompleted;
         private long _basisHistoricalTickCount;
+        private string _bridgeStatus = "CONNECTING: waiting for local bridge acknowledgement";
         private bool _disposed;
 
         private sealed class ObservedOrder
@@ -113,6 +114,11 @@ namespace AtasMt5ProbeStrategy
         [OFT.Attributes.ParameterAttribute]
         [DisplayName("ATAS API timestamp UTC offset minutes")]
         public int AtasApiTimestampUtcOffsetMinutes { get; set; } = 0;
+
+        [Browsable(true)]
+        [ReadOnly(true)]
+        [DisplayName("Bridge status (read-only)")]
+        public string BridgeStatus => _bridgeStatus;
 
         protected override void OnStarted()
         {
@@ -486,6 +492,7 @@ namespace AtasMt5ProbeStrategy
                             : AcknowledgementTimeoutMilliseconds);
                     if (acknowledgement != null)
                     {
+                        ApplyBridgeStatus(acknowledgement.BridgeStatus);
                         if (message.DeliveryMode == "sync")
                         {
                             var elapsedMilliseconds = (Stopwatch.GetTimestamp() - sentAt) * 1000.0 / Stopwatch.Frequency;
@@ -510,6 +517,18 @@ namespace AtasMt5ProbeStrategy
                     return;
                 }
             }
+        }
+
+        private void ApplyBridgeStatus(ProbeBridgeStatus? status)
+        {
+            if (status == null || string.IsNullOrWhiteSpace(status.State))
+                return;
+            var message = string.IsNullOrWhiteSpace(status.Message) ? status.State : status.Message;
+            var next = $"{status.State.ToUpperInvariant()}: {message}";
+            if (string.Equals(_bridgeStatus, next, StringComparison.Ordinal))
+                return;
+            _bridgeStatus = next;
+            StrategyLog.Append($"Bridge status source={GetSourceSymbol()}: {_bridgeStatus}\n");
         }
 
         private void MaybeEmitRecoverySnapshot(bool force = false)
