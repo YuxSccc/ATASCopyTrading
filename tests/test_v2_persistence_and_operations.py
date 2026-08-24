@@ -16,9 +16,13 @@ from atas_mt5_bridge.v2.models import (
     SourceEventType,
     SourceOrder,
     SourceOrderState,
+    SourceOrderKey,
     SourcePosition,
+    SourceSymbolState,
     TargetAccountModel,
     TargetAccountState,
+    TargetLeg,
+    TargetLegRole,
     TargetOrderState,
 )
 from atas_mt5_bridge.v2.operation_book import OperationBook
@@ -148,6 +152,84 @@ def test_failed_ticket_close_is_released_only_when_complete_snapshot_proves_posi
     resolved = book.resolve_from_snapshot(target_state(), IntentLedger())
     assert len(resolved) == 1
     assert resolved[0].status == OperationStatus.CONFIRMED
+
+
+def test_failed_create_is_released_only_when_source_explicitly_removed_it_and_mt5_order_is_absent():
+    book = OperationBook()
+    command = BridgeCommand(
+        command_id="create-failed",
+        command_type=CommandType.CREATE_PENDING,
+        target_symbol="XAUUSD",
+        source_event_id=1,
+        source_order_id="source-order",
+        leg_id="missing-leg",
+    )
+    book.dispatch(command)
+    book.apply_receipt(ExecutionReceipt(command.command_id, OperationStatus.FAILED, message="OrderSend failed"))
+    source = SourceSymbolState(
+        source_symbol="GC",
+        session_id="session-persist",
+        last_event_id=2,
+        position=None,
+        active_orders={},
+        synchronized=True,
+        explicitly_removed_order_ids=frozenset({"source-order"}),
+    )
+
+    incomplete = TargetAccountState(
+        target_symbol="XAUUSD",
+        model=TargetAccountModel.HEDGING,
+        long_quantity=Decimal("0"),
+        short_quantity=Decimal("0"),
+        snapshot_complete=False,
+    )
+    assert book.resolve_failed_creates_retired_at_source(incomplete, IntentLedger(), source) == ()
+
+    untouched_source = replace(source, explicitly_removed_order_ids=frozenset())
+    assert book.resolve_failed_creates_retired_at_source(target_state(), IntentLedger(), untouched_source) == ()
+
+    resolved = book.resolve_failed_creates_retired_at_source(target_state(), IntentLedger(), source)
+    assert len(resolved) == 1
+    assert resolved[0].status == OperationStatus.CONFIRMED
+
+
+def test_failed_create_is_released_after_a_new_atas_session_when_mt5_order_is_absent():
+    book = OperationBook()
+    command = BridgeCommand(
+        command_id="create-failed-old-session",
+        command_type=CommandType.CREATE_PENDING,
+        target_symbol="XAUUSD",
+        source_event_id=1,
+        source_order_id="source-order",
+        intent_id="old-session:GC:source-order",
+        leg_id="old-session:GC:source-order:leg:1",
+    )
+    book.dispatch(command)
+    book.apply_receipt(ExecutionReceipt(command.command_id, OperationStatus.FAILED, message="OrderSend failed"))
+    ledger = IntentLedger()
+    ledger.legs[command.leg_id] = TargetLeg(
+        leg_id=command.leg_id,
+        intent_id=command.intent_id,
+        source_key=SourceOrderKey("old-session", "GC", "source-order"),
+        role=TargetLegRole.ENTRY_PENDING,
+        side="buy",
+        order_type="limit",
+        quantity=Decimal("1"),
+        price=Decimal("4000"),
+        trigger_price=None,
+        bridge_tag="tag",
+    )
+    new_session = SourceSymbolState(
+        source_symbol="GC",
+        session_id="new-session",
+        last_event_id=1,
+        position=None,
+        active_orders={},
+        synchronized=True,
+    )
+
+    resolved = book.resolve_failed_creates_retired_at_source(target_state(), ledger, new_session)
+    assert len(resolved) == 1
 
 
 def test_confirmed_cancel_resolves_an_unobserved_create_for_the_same_leg():

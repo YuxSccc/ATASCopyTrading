@@ -20,18 +20,19 @@ namespace AtasMt5ProbeStrategy
     /// available from the installed ATAS version before copy logic is introduced.
     /// </summary>
     [Category("Custom")]
-    [DisplayName("AtasMt5BridgeProbeV8")]
+    [DisplayName("AtasMt5BridgeProbeV9")]
     public sealed class AtasBridgeProbeStrategy : ChartStrategy
     {
-        private const string BuildTag = "2026-08-24-probe-v8-compact-right-status";
+        private const string BuildTag = "2026-08-24-probe-v9-gap-free-events";
         private ProbeWebSocketClient? _client;
         private string _sessionId = "";
-        private long _eventSequence;
+        private long _queuedEventSequence;
+        private long _deliveredEventSequence;
         private readonly object _outboxLock = new object();
         private Task _outboxTail = Task.CompletedTask;
         private int _outboxBacklog;
         private long _droppedQuoteEvents;
-        private long _latestCriticalEventId;
+        private long _latestCriticalQueueSequence;
         private long _lastQuoteTicks;
         private long _lastRecoverySnapshotTicks;
         private decimal? _lastCapturedPositionVolume;
@@ -141,7 +142,8 @@ namespace AtasMt5ProbeStrategy
         {
             _disposed = false;
             _sessionId = Guid.NewGuid().ToString("N");
-            _eventSequence = 0;
+            _queuedEventSequence = 0;
+            _deliveredEventSequence = 0;
             _lastQuoteTicks = 0;
             _lastRecoverySnapshotTicks = 0;
             _lastCapturedPositionVolume = null;
@@ -151,7 +153,7 @@ namespace AtasMt5ProbeStrategy
                 _observedOrders.Clear();
             _outboxBacklog = 0;
             _droppedQuoteEvents = 0;
-            _latestCriticalEventId = 0;
+            _latestCriticalQueueSequence = 0;
             _client = new ProbeWebSocketClient(ServerUrl);
             _basisMinuteCloses.Clear();
             _lastBasisExportTicks = 0;
@@ -465,7 +467,11 @@ namespace AtasMt5ProbeStrategy
                 var message = new ProbeEnvelope
                 {
                     SessionId = _sessionId,
-                    EventId = ++_eventSequence,
+                    // ``EventId`` is assigned at send time. A queued quote
+                    // can be discarded before then, and must not create a
+                    // sequence gap that makes a later order callback unsafe.
+                    EventId = 0,
+                    QueueSequence = ++_queuedEventSequence,
                     EventType = eventType,
                     SourceSymbol = GetSourceSymbol(),
                     PairTag = NormalizedPairTag(),
@@ -477,7 +483,7 @@ namespace AtasMt5ProbeStrategy
                     Data = data,
                 };
                 if (IsCriticalEvent(eventType))
-                    Interlocked.Exchange(ref _latestCriticalEventId, message.EventId);
+                    Interlocked.Exchange(ref _latestCriticalQueueSequence, message.QueueSequence);
 
                 // ATAS callbacks can arrive close together. A task per event
                 // races for the WebSocket send lock and can invert event IDs.
@@ -511,10 +517,16 @@ namespace AtasMt5ProbeStrategy
                 try
                 {
                     if (string.Equals(message.EventType, "quote", StringComparison.Ordinal)
-                        && message.EventId < Interlocked.Read(ref _latestCriticalEventId))
+                        && message.QueueSequence < Interlocked.Read(ref _latestCriticalQueueSequence))
                         return;
                     if (_client == null)
                         return;
+
+                    // Preserve the same event id across a transport retry,
+                    // while assigning ids only to messages that will actually
+                    // be delivered to the bridge.
+                    if (message.EventId == 0)
+                        message.EventId = Interlocked.Increment(ref _deliveredEventSequence);
 
                     var sentAt = Stopwatch.GetTimestamp();
                     // Acknowledgement is awaited only by this background

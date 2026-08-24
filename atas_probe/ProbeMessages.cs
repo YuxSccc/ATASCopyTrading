@@ -17,6 +17,12 @@ namespace AtasMt5ProbeStrategy
         [JsonProperty("event_id")]
         public long EventId { get; set; }
 
+        // Queue sequencing is local-only. A queued quote may be discarded to
+        // let a later trading event pass, but discarded messages must never
+        // consume the wire event sequence used by the bridge state machine.
+        [JsonIgnore]
+        public long QueueSequence { get; set; }
+
         [JsonProperty("event_type")]
         public string EventType { get; set; } = "";
 

@@ -354,6 +354,11 @@ class SymbolCoordinator:
             self.ledger,
             resolved,
         )
+        retired_failed_creates = self.operation_book.resolve_failed_creates_retired_at_source(
+            target,
+            self.ledger,
+            self.source_book.snapshot(),
+        )
         resolved = (*resolved, *superseded_creates)
         for record in resolved:
             command = record.command
@@ -361,8 +366,11 @@ class SymbolCoordinator:
                 leg = self.ledger.get_leg(command.leg_id)
                 if leg is not None:
                     self.ledger.update_leg(replace(leg, state=TargetLegState.CANCELLED, target_order_ticket=None))
+        for record in retired_failed_creates:
+            self._rearm_leg_after_no_effect(record.command)
+        persisted = (*expired, *resolved, *retired_failed_creates)
         try:
-            self.state_store.save_ledger_and_operations(self.target_symbol, self.ledger, (*expired, *resolved))
+            self.state_store.save_ledger_and_operations(self.target_symbol, self.ledger, persisted)
         except Exception:
             return False
         return True

@@ -14,6 +14,7 @@ from .models import (
     OperationStatus,
     TargetAccountState,
     TargetLegState,
+    SourceSymbolState,
 )
 
 
@@ -156,6 +157,48 @@ class OperationBook:
                 record,
                 status=OperationStatus.CONFIRMED,
                 message="create was safely superseded by a confirmed ticket-specific cancellation",
+                resolved_at_utc=_now(),
+            )
+            self.records[command_id] = updated
+            resolved.append(updated)
+        return tuple(resolved)
+
+    def resolve_failed_creates_retired_at_source(
+        self,
+        target: TargetAccountState,
+        ledger: IntentLedger,
+        source: SourceSymbolState,
+    ) -> tuple[OperationRecord, ...]:
+        """Release a failed create whose source order has explicitly ended.
+
+        This is intentionally narrower than a general failed-create retry. An
+        ATAS must explicitly report the exact source order as done/cancelled,
+        or establish a newer probe session. A complete MT5 snapshot must also
+        show no matching pending order. Together those facts prove there is no
+        residual target order to protect and no source intent left to retry.
+        """
+
+        if not target.snapshot_complete:
+            return ()
+        resolved: list[OperationRecord] = []
+        for command_id, record in tuple(self.records.items()):
+            command = record.command
+            leg = ledger.get_leg(command.leg_id) if command.leg_id is not None else None
+            source_order_ended = command.source_order_id in source.explicitly_removed_order_ids
+            source_session_replaced = leg is not None and leg.source_key.session_id != source.session_id
+            if (
+                record.status != OperationStatus.FAILED
+                or record.resolved_at_utc is not None
+                or command.command_type != CommandType.CREATE_PENDING
+                or command.leg_id is None
+                or not (source_order_ended or source_session_replaced)
+                or _has_target_order_for_leg(command.leg_id, ledger, target)
+            ):
+                continue
+            updated = replace(
+                record,
+                status=OperationStatus.CONFIRMED,
+                message="failed create was safely retired after explicit ATAS removal and an absent complete MT5 snapshot",
                 resolved_at_utc=_now(),
             )
             self.records[command_id] = updated
