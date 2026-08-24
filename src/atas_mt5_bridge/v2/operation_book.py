@@ -85,11 +85,20 @@ class OperationBook:
                 OperationStatus.CONFIRMED,
                 OperationStatus.UNKNOWN,
             }
-            # A failed cancellation is normally quarantined.  The one safe
-            # automatic release is a later *complete* snapshot proving the
-            # target pending order is already absent; retrying or retaining
-            # that failure would only block unrelated new source orders.
-            if record.status == OperationStatus.FAILED and record.command.command_type == CommandType.CANCEL_PENDING:
+            # A failed ticket-specific cancellation or close is normally
+            # quarantined.  A later *complete* snapshot can, however, prove
+            # that the exact target object is already gone.  In that case it
+            # is safe to release the stale failure and let normal
+            # reconciliation evaluate the current source state; retaining it
+            # would indefinitely block unrelated later source orders.
+            #
+            # This deliberately excludes market opens and protection changes:
+            # absence of an object is not evidence that those commands had no
+            # target-side effect.
+            if record.status == OperationStatus.FAILED and record.command.command_type in {
+                CommandType.CANCEL_PENDING,
+                CommandType.CLOSE_POSITION,
+            }:
                 observable_statuses.add(OperationStatus.FAILED)
             if record.status not in observable_statuses:
                 continue

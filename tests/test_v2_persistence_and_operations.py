@@ -120,6 +120,36 @@ def test_failed_cancel_is_released_only_when_a_complete_snapshot_proves_order_ab
     assert resolved[0].status == OperationStatus.CONFIRMED
 
 
+def test_failed_ticket_close_is_released_only_when_complete_snapshot_proves_position_absent():
+    book = OperationBook()
+    command = BridgeCommand(
+        command_id="close-failed",
+        command_type=CommandType.CLOSE_POSITION,
+        target_symbol="XAUUSD",
+        source_event_id=1,
+        payload={
+            "position_ticket": "123",
+            "quantity": Decimal("0.05"),
+            "expected_position_remaining": Decimal("0"),
+        },
+    )
+    book.dispatch(command)
+    book.apply_receipt(ExecutionReceipt(command.command_id, OperationStatus.FAILED, message="OrderSend failed"))
+
+    incomplete = TargetAccountState(
+        target_symbol="XAUUSD",
+        model=TargetAccountModel.HEDGING,
+        long_quantity=Decimal("0"),
+        short_quantity=Decimal("0"),
+        snapshot_complete=False,
+    )
+    assert book.resolve_from_snapshot(incomplete, IntentLedger()) == ()
+
+    resolved = book.resolve_from_snapshot(target_state(), IntentLedger())
+    assert len(resolved) == 1
+    assert resolved[0].status == OperationStatus.CONFIRMED
+
+
 def test_confirmed_cancel_resolves_an_unobserved_create_for_the_same_leg():
     """A fast ATAS cancel can remove an EA-accepted create before a snapshot."""
 
