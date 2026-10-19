@@ -1,5 +1,12 @@
 # ATAS to MT5 Bridge
 
+## GC/MGC drawing sync
+
+The standalone `GC-MGC Drawing Sync V1` indicator displays native MGC rectangles
+and trend lines on GC, including moves and deletions. Add it to both charts;
+Auto mode publishes on MGC and receives on GC. See
+[setup and diagnostics](docs/GC_MGC_DRAWING_SYNC.md).
+
 ## Automated demo test (ATAS order API)
 
 The test driver is a separate ATAS strategy, `AtasMt5TestDriver`.  It is not

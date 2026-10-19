@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <AssemblyName>CrossInstrumentDrawingsV1</AssemblyName>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.1.0.0</FileVersion>
+    <ATAS_HOME Condition="'$(ATAS_HOME)' == ''">D:\ATAS Platform</ATAS_HOME>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="ATAS.Indicators"><HintPath>$(ATAS_HOME)\ATAS.Indicators.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="OFT.Attributes"><HintPath>$(ATAS_HOME)\OFT.Attributes.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="OFT.Rendering"><HintPath>$(ATAS_HOME)\OFT.Rendering.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Utils.Common"><HintPath>$(ATAS_HOME)\Utils.Common.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+</Project>
