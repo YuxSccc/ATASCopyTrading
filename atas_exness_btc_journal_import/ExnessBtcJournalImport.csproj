@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <AssemblyName>ExnessBtcJournalImport</AssemblyName>
+    <Version>1.3.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.3.0.0</FileVersion>
+    <ATAS_HOME Condition="'$(ATAS_HOME)' == ''">D:\ATAS Platform</ATAS_HOME>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="ExnessJournalSmoke"/>
+    <Compile Include="..\atas_exness_review\ReviewStore.cs" Link="ReviewStore.cs"/>
+    <Compile Include="..\atas_exness_journal_import\JournalBatch.cs" Link="JournalBatch.cs"/>
+    <Compile Include="..\atas_exness_journal_import\PendingJournalImport.cs" Link="PendingJournalImport.cs"/>
+    <Reference Include="ATAS.Indicators;ATAS.DataFeedsCore;CommonServiceLocator;OFT.Platform.Core;Utils.Common;OFT.Core;OFT.Models">
+      <HintPath>$(ATAS_HOME)\%(Identity).dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

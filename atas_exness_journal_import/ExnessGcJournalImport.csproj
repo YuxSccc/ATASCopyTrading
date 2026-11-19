@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <AssemblyName>ExnessGcJournalImport</AssemblyName>
+    <ATAS_HOME Condition="'$(ATAS_HOME)' == ''">D:\ATAS Platform</ATAS_HOME>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\atas_exness_review\ReviewStore.cs" Link="ReviewStore.cs"/>
+    <Reference Include="ATAS.Indicators;ATAS.DataFeedsCore;CommonServiceLocator;OFT.Platform.Core;Utils.Common;OFT.Core;OFT.Models">
+      <HintPath>$(ATAS_HOME)\%(Identity).dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

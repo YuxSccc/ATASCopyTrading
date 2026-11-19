@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../atas_exness_review/TickPrices.cs" Link="TickPrices.cs" />
+    <Compile Include="../../atas_exness_review/TickPriceMatches.cs" Link="TickPriceMatches.cs" />
+    <Compile Include="../../atas_exness_review/ReviewGeometry.cs" Link="ReviewGeometry.cs" />
+  </ItemGroup>
+</Project>
